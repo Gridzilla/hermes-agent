@@ -7526,6 +7526,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         model_list = live
                 except Exception:
                     pass
+            # Sort alphabetically (case-insensitive) so providers with 100+
+            # live models like DeepInfra, OpenRouter, HuggingFace are
+            # navigable in the TUI picker instead of catalog-order scrambles.
+            if model_list:
+                model_list = sorted(model_list, key=str.casefold)
             state["stage"] = "model"
             state["provider_data"] = provider_data
             state["model_list"] = model_list

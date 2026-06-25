@@ -6499,11 +6499,13 @@ def _prompt_model_selection(
             return None
         return mid
 
-    # Reorder: current model first, then the rest (deduplicated)
+    # Reorder: current model first, then the rest (deduplicated, sorted
+    # alphabetically so providers with 100+ live models like DeepInfra,
+    # OpenRouter, HuggingFace are navigable instead of catalog-order scrambles)
     ordered = []
     if current_model and current_model in model_ids:
         ordered.append(current_model)
-    for mid in model_ids:
+    for mid in sorted(model_ids, key=str.casefold):
         if mid not in ordered:
             ordered.append(mid)
 
