@@ -26,10 +26,35 @@ piecemeal, the footer is sent as a separate trailing message via
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
-_DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
+_DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd", "caveman")
 _SEP = " · "
+
+
+def _read_caveman_status() -> str:
+    """Read caveman status from env or file, default to 'off'.
+
+    Caveman compression is OPT-IN: active only when the user enables it
+    (HERMES_CAVEMAN_MODE env or ~/.hermes/caveman_mode file). The footer reflects
+    real state, not a presumed default.
+    """
+    # Check environment variable first (set by session when toggled)
+    env_status = os.environ.get("HERMES_CAVEMAN_MODE")
+    if env_status:
+        return f"caveman:{env_status}"
+    # Check a session state file (for persistence across gateway restarts)
+    state_file = Path.home() / ".hermes" / "caveman_mode"
+    try:
+        if state_file.exists():
+            mode = state_file.read_text().strip()
+            if mode:
+                return f"caveman:{mode}"
+    except Exception:
+        pass
+    # Default: caveman is off unless explicitly enabled
+    return "caveman:off"
 
 
 def _home_relative_cwd(cwd: str) -> str:
@@ -95,11 +120,15 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
+    caveman_level: Optional[str] = None,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
 
     Fields are skipped silently when their underlying data is missing — a
     partially-populated footer is better than a line with ``?%`` or empty slots.
+
+    ``caveman_level`` (bare level, e.g. "ultra") is the session-scoped value
+    resolved by the caller; when omitted the global default file is read.
     """
     parts: list[str] = []
     for field in fields:
@@ -115,6 +144,11 @@ def format_runtime_footer(
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
+        elif field == "caveman":
+            if caveman_level is not None:
+                parts.append(f"caveman:{caveman_level}")
+            else:
+                parts.append(_read_caveman_status())
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -130,6 +164,7 @@ def build_footer_line(
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
+    caveman_level: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -146,4 +181,5 @@ def build_footer_line(
         context_length=context_length,
         cwd=cwd,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
+        caveman_level=caveman_level,
     )

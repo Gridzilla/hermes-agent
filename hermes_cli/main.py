@@ -295,6 +295,7 @@ from hermes_cli.subcommands.memory import build_memory_parser
 from hermes_cli.subcommands.acp import build_acp_parser
 from hermes_cli.subcommands.tools import build_tools_parser
 from hermes_cli.subcommands.insights import build_insights_parser
+from hermes_cli.subcommands.usage import build_usage_parser
 from hermes_cli.subcommands.skills import build_skills_parser
 from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
@@ -3118,6 +3119,8 @@ def select_provider_and_model(args=None):
         "xiaomi",
         "arcee",
         "gmi",
+        "neuralwatt",
+        "wafer",
         "nvidia",
         "ollama-cloud",
         "tencent-tokenhub",
@@ -11963,6 +11966,43 @@ def cmd_insights(args):
         print(f"Error generating insights: {e}")
 
 
+def cmd_usage(args):
+    """Show token usage against allowance via the standalone collector."""
+    import os
+    import subprocess
+    import sys
+
+    collector = os.path.join(
+        os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+        "scripts", "usage_collect.py",
+    )
+    if not os.path.isfile(collector):
+        print("Usage collector not found. Expected at:\n  " + collector)
+        print("Ensure ~/.hermes/scripts/usage_collect.py is installed.")
+        return
+
+    cmd = [sys.executable, collector]
+    if getattr(args, "json", False):
+        pass  # JSON is the collector's default output
+    else:
+        cmd.append("--report")
+    if getattr(args, "record", False):
+        cmd.append("--record")
+    if getattr(args, "zai_only", False):
+        cmd.append("--zai-only")
+    if getattr(args, "codex_only", False):
+        cmd.append("--codex-only")
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.returncode != 0 and result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+    except Exception as e:
+        print(f"Error running usage collector: {e}", file=sys.stderr)
+
+
 def cmd_skills(args):
     # Route 'config' action to skills_config module
     if getattr(args, "skills_action", None) == "config":
@@ -12916,6 +12956,11 @@ def main():
     # insights command  (parser built in hermes_cli/subcommands/insights.py)
     # =========================================================================
     build_insights_parser(subparsers, cmd_insights=cmd_insights)
+
+    # =========================================================================
+    # usage command  (parser built in hermes_cli/subcommands/usage.py)
+    # =========================================================================
+    build_usage_parser(subparsers, cmd_usage=cmd_usage)
 
     # =========================================================================
     # claw command  (parser built in hermes_cli/subcommands/claw.py)

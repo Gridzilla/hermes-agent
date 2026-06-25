@@ -2496,6 +2496,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _stop_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+    _session_caveman_overrides: Dict[str, str] = {}
     _startup_restore_in_progress: bool = False
 
     def __init__(self, config: Optional[GatewayConfig] = None):
@@ -2627,6 +2628,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+        # Per-session caveman level overrides from /caveman (session-scoped).
+        # Key: session_key, Value: level str ("lite"/"full"/.../"off").
+        self._session_caveman_overrides: Dict[str, str] = {}
         self._kanban_notifier_profile = self._active_profile_name()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
@@ -3087,6 +3091,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
             profile=_profile,
         )
+
+    def _caveman_level_for_session(self, session_key: str) -> str:
+        """Session-scoped caveman level: per-chat override → global default → off.
+
+        Mirrors how /model resolves per-session model overrides. Used by the
+        runtime footer so each gateway chat shows its own caveman level instead
+        of a shared global value. Local patch #9.
+        """
+        if session_key and session_key in self._session_caveman_overrides:
+            return self._session_caveman_overrides[session_key]
+        try:
+            from gateway.runtime_footer import _read_caveman_status
+            raw = _read_caveman_status()  # "caveman:<level>" or "caveman:off"
+            return raw.split(":", 1)[-1] if ":" in raw else "off"
+        except Exception:
+            return "off"
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -8116,6 +8136,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "footer":
             return await self._handle_footer_command(event)
 
+        if canonical == "caveman":
+            return await self._handle_caveman_command(event)
+
         if canonical == "yolo":
             return await self._handle_yolo_command(event)
 
@@ -9743,6 +9766,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
+                    caveman_level=self._caveman_level_for_session(
+                        self._session_key_for_source(source)
+                    ),
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
@@ -13277,6 +13303,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     })
                     if not synth_text:
                         break
+                    # LOCAL PATCH (task-completion-notify): best-effort copy of
+                    # the completion to a central topic (agent.task_completion_target).
+                    # Dedupes against the origin chat inside the helper.
+                    try:
+                        import asyncio as _tc_aio
+                        from agent.retry_utils import send_task_completion_notification as _tc_send
+                        await _tc_aio.to_thread(
+                            _tc_send,
+                            session_id=session_id,
+                            command=session.command,
+                            exit_code=session.exit_code,
+                            output=_out,
+                            origin_platform=platform_name,
+                            origin_chat_id=chat_id,
+                            origin_thread_id=thread_id,
+                        )
+                    except Exception:
+                        pass
                     source = self._build_process_event_source({
                         "session_id": session_id,
                         "session_key": session_key,

@@ -2451,6 +2451,65 @@ class GatewaySlashCommandsMixin:
             return t("gateway.fast.saved", label=label)
         return t("gateway.fast.session_only", label=label)
 
+    async def _handle_caveman_command(self, event: MessageEvent) -> str:
+        """Handle ``/caveman [lite|full|ultra|wenyan|off] [--global]``.
+
+        Session-scoped like /model: stores a per-chat override so other gateway
+        chats keep their own level (the footer reads it via
+        _caveman_level_for_session). ``--global`` writes the global default
+        file for new sessions. Compression stays prompt-driven via the caveman
+        skill. Local patch #9.
+        """
+        raw = (event.get_command_args() or "").strip().lower()
+        tokens = raw.split() if raw else []
+        persist_global = "--global" in tokens or "--save" in tokens
+        tokens = [t for t in tokens if t not in ("--global", "--save")]
+        arg = tokens[0] if tokens else ""
+        _LEVELS = ("lite", "full", "ultra", "wenyan")
+        _OFF = ("off", "normal", "disable", "disabled")
+
+        session_key = self._session_key_for_source(event.source)
+
+        if not arg:
+            cur = self._caveman_level_for_session(session_key)
+            opts = ", ".join(_LEVELS) + ", off"
+            return (f"Caveman: 🪨 {cur}\n"
+                    f"Options: {opts}\n"
+                    f"/caveman <level> [--global]")
+
+        if arg in _OFF:
+            level = "off"
+        elif arg in _LEVELS:
+            level = arg
+        else:
+            return f"Unknown caveman level: {arg}. Use lite|full|ultra|wenyan|off."
+
+        # Per-chat override (session-scoped) — other chats unaffected.
+        self._session_caveman_overrides[session_key] = level
+
+        # Persist as new-session default (--global).
+        if persist_global:
+            import os as _os
+            from pathlib import Path
+            state_file = Path.home() / ".hermes" / "caveman_mode"
+            try:
+                if level == "off":
+                    if state_file.exists():
+                        state_file.unlink()
+                else:
+                    tmp = state_file.with_suffix(".tmp")
+                    tmp.write_text(level, encoding="utf-8")
+                    _os.replace(str(tmp), str(state_file))
+            except Exception as exc:
+                return f"🪨 caveman: {level} (this chat). ⚠ --global write failed: {exc}"
+
+        if persist_global:
+            scope = "global default updated (--global)"
+        else:
+            scope = "this chat only — add --global for new-session default"
+        hint = "" if level == "off" else " Load the caveman skill for compression."
+        return f"🪨 caveman: {level} ({scope}).{hint}"
+
     async def _handle_yolo_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /yolo — toggle dangerous command approval bypass for this session only."""
         from tools.approval import (

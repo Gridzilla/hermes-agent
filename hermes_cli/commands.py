@@ -138,6 +138,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("timestamps", "Toggle [HH:MM] timestamps on messages and /history", "Configuration",
                cli_only=True, args_hint="[on|off|status]",
                subcommands=("on", "off", "status"), aliases=("ts",)),
+    CommandDef("caveman", "Set caveman compression mode (status-bar / footer indicator)",
+               "Configuration",
+               args_hint="[lite|full|ultra|wenyan|off]",
+               subcommands=("lite", "full", "ultra", "wenyan", "off", "normal")),
     CommandDef("verbose", "Cycle tool progress display: off -> new -> all -> verbose",
                "Configuration", cli_only=True,
                gateway_config_gate="display.tool_progress_command"),
@@ -222,6 +226,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
+    CommandDef("cache", "Show cache hit rate (5h/weekly/monthly) for the current provider. Use /cache --all to aggregate across all providers", "Info",
+               args_hint="[--all]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
                cli_only=True, aliases=("gateway",)),
     CommandDef("platform", "Pause, resume, or list a failing gateway platform", "Info",
@@ -237,8 +243,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info"),
 
     # Exit
-    CommandDef("quit", "Exit the CLI (use --delete to also remove session history)", "Exit",
-               cli_only=True, aliases=("exit",), args_hint="[--delete]"),
+    CommandDef("quit", "Exit the CLI (--delete removes history, --hgm updates HGM first)", "Exit",
+               cli_only=True, aliases=("exit",), args_hint="[--delete] [--hgm]"),
 ]
 
 

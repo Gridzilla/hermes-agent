@@ -1,0 +1,5 @@
+name: wafer-provider
+kind: model-provider
+version: 1.0.0
+description: Wafer AI — multi-model OpenAI-compatible direct API (ZDR-capable)
+author: Nous Research

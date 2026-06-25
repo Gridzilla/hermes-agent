@@ -804,12 +804,18 @@ def build_anthropic_client(
         # OAuth access token / setup-token → Bearer auth + Claude Code identity.
         # Anthropic routes OAuth requests based on user-agent and headers;
         # without Claude Code's fingerprint, requests get intermittent 500s.
+        # Also spoof Stainless headers to match Claude Code's fingerprint exactly
+        # (prevents "You're out of extra usage" false-positive 400s).
         all_betas = common_betas + _OAUTH_ONLY_BETAS
         kwargs["auth_token"] = api_key
         kwargs["default_headers"] = {
             "anthropic-beta": ",".join(all_betas),
             "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
             "x-app": "cli",
+            "X-Stainless-Lang": "js",
+            "X-Stainless-Runtime": "node",
+            "X-Stainless-Package-Version": "0.27.0",
+            "X-Stainless-Runtime-Version": "v22.15.0",
         }
     else:
         # Regular API key → x-api-key header + common betas

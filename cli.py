@@ -3730,6 +3730,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # process_command() when the user runs /exit --delete or /quit --delete.
         # Ported from google-gemini/gemini-cli#19332.
         self._delete_session_on_exit = False
+        # /exit --hgm: when True, a detached HGM-review of this session is
+        # spawned during shutdown (after the active-session claim is released)
+        # so durable knowledge is written to ~/hgm. Local core patch #5.
+        self._update_hgm_on_exit = False
+        # /exit --hgm --delete: review reads the session first, THEN deletes it
+        # via scripts/hgm_review.py --delete-after (so we skip the immediate
+        # _delete_session_on_exit path for this combo).
+        self._hgm_delete_after = False
         # /update: when set, run() executes relaunch() after prompt_toolkit
         # has fully exited and cleaned up terminal modes.  Set by
         # _handle_update_command() so the relaunch happens on the main thread,
@@ -3846,6 +3854,41 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             logger.debug("Failed to release active session slot", exc_info=True)
         finally:
             self._active_session_lease = None
+
+    def _spawn_hgm_review(self, *, delete_after: bool = False) -> None:
+        """Spawn a detached HGM-review of the current session (local patch #5).
+
+        Launches ``scripts/hgm_review.py <session_id> [--delete-after]`` as a
+        detached subprocess (``start_new_session=True``) so it survives this
+        process exit. The helper sleeps before doing real work, letting the
+        parent exit and release the active-session claim (``hermes chat -q``
+        also claims that slot). Best-effort: never raises, logs warnings only.
+        Called from process_command() on the ``/exit --hgm`` path.
+        """
+        try:
+            import sys as _sys
+            import subprocess as _sp
+            from hermes_constants import get_hermes_home as _ghh
+            _review_script = _ghh() / "scripts" / "hgm_review.py"
+            if not _review_script.exists():
+                logger.warning("hgm_review.py not found at %s; skipping HGM update on exit", _review_script)
+                return
+            if not getattr(self, "agent", None):
+                logger.warning("HGM review on exit skipped: no active agent/session")
+                return
+            _sid = self.agent.session_id
+            _cmd = [_sys.executable, str(_review_script), _sid]
+            if delete_after:
+                _cmd.append("--delete-after")
+            _sp.Popen(
+                _cmd,
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                stdin=_sp.DEVNULL, start_new_session=True,
+            )
+            _what = "review + delete" if delete_after else "review"
+            _cprint(f"  {_DIM}✓ HGM {_what} of {_escape(_sid)} spawned in background{_RST}")
+        except Exception as _e:
+            logger.warning("Could not spawn HGM review on exit: %s", _e)
 
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint for high-frequency background updates.
@@ -4222,6 +4265,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             "compressions": 0,
             "active_background_tasks": 0,
             "active_background_processes": 0,
+            "caveman_mode": self._get_caveman_status(),
         }
 
         # Count live /background tasks. The dict entry is removed in the
@@ -4274,7 +4318,202 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             if context_length:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
 
+        # Local patch #6: publish live context (main + background subagent
+        # children) to a per-session snapshot file, throttled, so external
+        # readers (the caveman-status cron) can report TRUE max-context across
+        # the main session and its delegate_task children. Best-effort.
+        try:
+            self._publish_context_snapshot(agent, snapshot)
+        except Exception:
+            pass
+
         return snapshot
+
+    def _publish_context_snapshot(self, agent, snapshot: dict) -> None:
+        """Write live context (main + background subagents) to a JSON file.
+
+        Throttled to one write per ~10s (the status-bar refresh fires far more
+        often). Output: ``<HERMES_HOME>/runtime/sctx_<session_id>.json`` with
+        ``{sid, ts, main:{ctx,len,pct}, children:[...], max:{ctx,len,pct}}``.
+        Local core patch #6.
+        """
+        import time as _t
+        import json as _json
+        import os as _os
+        now = _t.time()
+        if now - getattr(self, "_last_ctx_publish_ts", 0.0) < 10.0:
+            return
+        self._last_ctx_publish_ts = now
+
+        sid = getattr(agent, "session_id", None) or getattr(self, "session_id", "")
+        main_ctx = int(snapshot.get("context_tokens") or 0)
+        main_len = int(snapshot.get("context_length") or 0)
+        max_ctx, max_len = main_ctx, main_len
+        children = []
+
+        def _gather(kids):
+            nonlocal max_ctx, max_len
+            for _ch in list(kids):
+                try:
+                    cc = getattr(_ch, "context_compressor", None)
+                    if not cc:
+                        continue
+                    ct = int(getattr(cc, "last_prompt_tokens", 0) or 0)
+                    cl = int(getattr(cc, "context_length", 0) or 0)
+                    if ct < 0:
+                        ct = 0
+                    if ct > max_ctx:
+                        max_ctx, max_len = ct, cl
+                    children.append({
+                        "sid": (getattr(_ch, "session_id", "") or "")[-8:],
+                        "ctx": ct,
+                        "len": cl,
+                        "pct": round((ct / cl) * 100) if cl else None,
+                    })
+                except Exception:
+                    continue
+
+        lock = getattr(agent, "_active_children_lock", None)
+        kids = getattr(agent, "_active_children", None) or []
+        try:
+            if lock:
+                with lock:
+                    _gather(kids)
+            else:
+                _gather(kids)
+        except Exception:
+            pass
+
+        def _pct(c, l):
+            return round((c / l) * 100) if l else None
+        payload = {
+            "sid": sid,
+            "ts": int(now),
+            "main": {"ctx": main_ctx, "len": main_len, "pct": _pct(main_ctx, main_len)},
+            "children": children,
+            "max": {"ctx": max_ctx, "len": max_len, "pct": _pct(max_ctx, max_len)},
+        }
+        try:
+            from hermes_constants import get_hermes_home as _ghh
+            d = _ghh() / "runtime"
+            d.mkdir(parents=True, exist_ok=True)
+            tmp = d / f".sctx_{sid}.tmp"
+            out = d / f"sctx_{sid}.json"
+            tmp.write_text(_json.dumps(payload))
+            _os.replace(str(tmp), str(out))
+        except Exception:
+            pass
+
+    def _get_caveman_status(self) -> str:
+        """Return the caveman level for THIS session (session-scoped, in-memory).
+
+        Mirrors how /model holds the active model: the level lives in
+        ``self._caveman_session_level`` and is changed only by ``/caveman``. It
+        is initialized ONCE at first read from the global default
+        (``HERMES_CAVEMAN_MODE`` env, else ``~/.hermes/caveman_mode``) — i.e. the
+        new-session default. After that, writes to the global file do NOT affect
+        this running session; only NEW sessions pick up the change at startup.
+        Use ``/caveman <level> --global`` to persist a new default. Local patch #9.
+        """
+        if not hasattr(self, "_caveman_session_level"):
+            level = os.environ.get("HERMES_CAVEMAN_MODE") or ""
+            if not level:
+                state_file = Path.home() / ".hermes" / "caveman_mode"
+                try:
+                    if state_file.exists():
+                        level = state_file.read_text().strip()
+                except Exception:
+                    level = ""
+            self._caveman_session_level = level or "off"
+        return self._caveman_session_level
+
+    def _handle_caveman_command(self, command: str) -> None:
+        """Handle ``/caveman [lite|full|ultra|wenyan|off] [--global]``.
+
+        Session-scoped like ``/model``: the level lives in
+        ``self._caveman_session_level`` (initialized once at startup from the
+        global default), so changing it here affects ONLY this session — other
+        running sessions keep their own level. ``--global`` additionally writes
+        the global default file so NEW sessions inherit the level.
+
+        No-arg prints the current level + the option menu (mirrors /fast, /voice).
+        The indicator and compression are coupled: setting a level also queues an
+        explicit in-conversation directive so the model compresses (the
+        salience-robust trigger). Local patch #9.
+        """
+        parts = command.strip().split(None, 1)
+        argstr = (parts[1].strip() if len(parts) > 1 else "")
+        tokens = argstr.split() if argstr else []
+        _LEVELS = ("lite", "full", "ultra", "wenyan")
+        _OFF = ("off", "normal", "disable", "disabled")
+        persist_global = "--global" in tokens or "--save" in tokens
+        tokens = [t for t in tokens if t not in ("--global", "--save")]
+        arg = tokens[0].lower() if tokens else ""
+
+        current = self._get_caveman_status()
+
+        # No-arg: show current level + options menu (mirrors /fast, /voice).
+        if not arg:
+            _cprint(f"  {_DIM}Caveman mode: 🪨 {current}{_RST}")
+            _cprint(f"  {_DIM}Options:{_RST}")
+            for _lv in _LEVELS:
+                _mark = "●" if _lv == current else "○"
+                _cprint(f"    {_DIM}{_mark} /caveman {_lv}{_RST}")
+            _cprint(f"    {_DIM}○ /caveman off   (standard prose){_RST}")
+            _cprint(f"  {_DIM}Add --global to also set the default for new sessions.{_RST}")
+            return
+
+        if arg in _OFF:
+            level = "off"
+        elif arg in _LEVELS:
+            level = arg
+        else:
+            _cprint(f"  {_DIM}✗ Unknown level: {_escape(arg)}. "
+                    f"Use lite|full|ultra|wenyan|off.{_RST}")
+            return
+
+        # Apply to THIS session only (in-memory, session-scoped).
+        self._caveman_session_level = level
+
+        # Persist as the new-session default (--global), mirroring /model --global.
+        if persist_global:
+            state_file = Path.home() / ".hermes" / "caveman_mode"
+            try:
+                if level == "off":
+                    if state_file.exists():
+                        state_file.unlink()
+                else:
+                    tmp = state_file.with_suffix(".tmp")
+                    tmp.write_text(level, encoding="utf-8")
+                    os.replace(str(tmp), str(state_file))
+            except Exception as exc:
+                _cprint(f"  {_DIM}⚠ --global write failed: {_escape(str(exc))}{_RST}")
+
+        if persist_global:
+            scope = "Saved to ~/.hermes/caveman_mode (--global)"
+        else:
+            scope = "session only — add --global to set the default for new sessions"
+        _cprint(f"  {_DIM}🪨 caveman: {level}  ({scope}){_RST}")
+
+        # Queue an explicit directive so the model compresses (or resumes prose).
+        if level != "off":
+            directive = (
+                f"Caveman {level} mode is now active for this session. From now "
+                f"on compress your output in that caveman style (~65-75% fewer "
+                f"output tokens) while preserving 100% technical accuracy — keep "
+                f"all code, paths, CLI commands, and error strings verbatim. "
+                f"Acknowledge briefly (one short line), then apply it to all "
+                f"following replies."
+            )
+        else:
+            directive = (
+                "Caveman mode disabled for this session. Resume standard prose "
+                "for all following replies."
+            )
+        try:
+            self._pending_input.put(directive)
+        except Exception:
+            pass
 
     @staticmethod
     def _status_bar_display_width(text: str) -> int:
@@ -4477,13 +4716,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             duration_label = snapshot["duration"]
 
             yolo_active = self._is_session_yolo_active()
+            caveman_mode = snapshot.get("caveman_mode", "full")
+            caveman_label = f"🪨 {caveman_mode}" if caveman_mode != "off" else "🪨 off"
             if width < 52:
                 text = f"⚕ {snapshot['model_short']} · {duration_label}"
                 if yolo_active:
                     text += " · ⚠ YOLO"
                 return self._trim_status_bar_text(text, width)
             if width < 76:
-                parts = [f"⚕ {snapshot['model_short']}", percent_label]
+                parts = [f"⚕ {snapshot['model_short']}", percent_label, caveman_label]
                 compressions = snapshot.get("compressions", 0)
                 if compressions:
                     parts.append(f"🗜️ {compressions}")
@@ -4506,7 +4747,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 context_label = "ctx --"
 
             compressions = snapshot.get("compressions", 0)
-            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label, caveman_label]
             if compressions:
                 parts.append(f"🗜️ {compressions}")
             bg_count = snapshot.get("active_background_tasks", 0)
@@ -4556,6 +4797,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             else:
                 percent = snapshot["context_percent"]
                 percent_label = f"{percent}%" if percent is not None else "--"
+                caveman_mode = snapshot.get("caveman_mode", "full")
+                caveman_label = f"🪨 {caveman_mode}" if caveman_mode != "off" else "🪨 off"
                 if width < 76:
                     compressions = snapshot.get("compressions", 0)
                     bg_count = snapshot.get("active_background_tasks", 0)
@@ -4565,6 +4808,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         ("class:status-bar-strong", snapshot["model_short"]),
                         ("class:status-bar-dim", " · "),
                         (self._status_bar_context_style(percent), percent_label),
+                        ("class:status-bar-dim", " · "),
+                        ("class:status-bar-dim", caveman_label),
                     ]
                     if compressions:
                         frags.append(("class:status-bar-dim", " · "))
@@ -4595,6 +4840,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     compressions = snapshot.get("compressions", 0)
                     bg_count = snapshot.get("active_background_tasks", 0)
                     bg_proc_count = snapshot.get("active_background_processes", 0)
+                    caveman_mode = snapshot.get("caveman_mode", "full")
+                    caveman_label = f"🪨 {caveman_mode}" if caveman_mode != "off" else "🪨 off"
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
@@ -4604,6 +4851,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         (bar_style, self._build_context_bar(percent)),
                         ("class:status-bar-dim", " "),
                         (bar_style, percent_label),
+                        ("class:status-bar-dim", " │ "),
+                        ("class:status-bar-dim", caveman_label),
                     ]
                     if compressions:
                         frags.append(("class:status-bar-dim", " │ "))
@@ -7758,12 +8007,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # session's transcripts + SQLite history. Ported from
             # google-gemini/gemini-cli#19332.
             _rest = cmd_original.split(None, 1)
-            _args = (_rest[1] if len(_rest) > 1 else "").strip().lower()
-            if _args in {"--delete", "-d"}:
-                self._delete_session_on_exit = True
-            elif _args:
-                _cprint(f"  {_DIM}✗ Unknown argument: {_escape(_args)}. Use /exit --delete to also remove session history.{_RST}")
+            _argstr = (_rest[1] if len(_rest) > 1 else "").strip().lower()
+            _tokens = _argstr.split() if _argstr else []
+            _hgm_flag = False
+            _del_flag = False
+            _unknown = []
+            for _tok in _tokens:
+                if _tok in {"--delete", "-d"}:
+                    _del_flag = True
+                elif _tok == "--hgm":
+                    _hgm_flag = True
+                else:
+                    _unknown.append(_tok)
+            if _unknown:
+                _cprint(f"  {_DIM}✗ Unknown argument: {_escape(' '.join(_unknown))}. Use /exit [--delete] [--hgm].{_RST}")
                 return True
+            # --hgm: spawn a detached HGM-review of this session at shutdown
+            # (see the spawn block after _release_active_session). With --delete
+            # too, the review reads the session first then deletes it, so we do
+            # NOT take the immediate _delete_session_on_exit path in that combo.
+            if _hgm_flag:
+                self._update_hgm_on_exit = True
+                self._hgm_delete_after = _del_flag
+                self._delete_session_on_exit = False
+                # Spawn the detached HGM review NOW — this code path is proven
+                # to run (same site as the --delete flag). The helper sleeps
+                # before doing work so the parent can exit and release the
+                # active-session claim first. Local core patch #5.
+                self._spawn_hgm_review(delete_after=_del_flag)
+            elif _del_flag:
+                self._delete_session_on_exit = True
             return False
         elif canonical == "help":
             self.show_help()
@@ -8016,6 +8289,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._show_billing(cmd_original)
         elif canonical == "insights":
             self._show_insights(cmd_original)
+        elif canonical == "cache":
+            self._show_cache_stats(cmd_original)
         elif canonical == "copy":
             self._handle_copy_command(cmd_original)
         elif canonical == "debug":
@@ -8167,6 +8442,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_voice_command(cmd_original)
         elif canonical == "busy":
             self._handle_busy_command(cmd_original)
+        elif canonical == "caveman":
+            self._handle_caveman_command(cmd_original)
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
             base_cmd = cmd_lower.split()[0]
@@ -9626,6 +9903,268 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         )
         _cprint(f"  {_d(_limit_note)}")
         self._billing_portal_hint(state)
+
+    def _show_cache_stats(self, command: str = "/cache"):
+        """Show prompt-cache hit rate for the current provider across 5h/week/month windows.
+
+        By default only the current provider's sessions are counted.  The
+        match is on the **hostname** of ``billing_base_url`` (the stable
+        identity) OR the ``billing_provider`` label, so historical sessions
+        that used the same upstream API under a different label (e.g.
+        ``custom`` before a native provider was registered, like
+        ``neuralwatt`` or ``opencode-go``) and trailing-slash URL variants
+        (``/v1`` vs ``/v1/``) are all folded together.  ``/cache --all``
+        aggregates across every provider.
+        """
+        import sqlite3
+        import time
+        from collections import defaultdict
+        from datetime import datetime
+        from pathlib import Path
+        from urllib.parse import urlparse
+
+        # /cache --all  → aggregate across every provider
+        show_all = "--all" in (command or "")
+
+        hermes_home = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+        state_db = hermes_home / "state.db"
+        if not state_db.exists():
+            print("  No session database found.")
+            return
+
+        # Determine current provider label and base_url.  ``agent.provider``
+        # is authoritative for the label (it's what gets written to
+        # ``billing_provider`` at session-end).  But ``agent.base_url`` can go
+        # STALE after a mid-session ``/model --provider`` switch — the switch
+        # updates ``agent.provider`` but may not update ``agent.base_url``
+        # (only does when the new value is non-empty).  That produces a
+        # mismatch like "provider: zai (host: opencode.ai)".
+        #
+        # So: resolve the base_url from the credential pool keyed on the
+        # provider label (the same source the DB row's billing_base_url came
+        # from), falling back to agent.base_url.  The credential pool is the
+        # source of truth and always matches what was persisted.
+        provider_label = None
+        live_base_url = None
+        if self.agent:
+            provider_label = getattr(self.agent, "provider", None) or getattr(self.agent, "model", None)
+        if not provider_label:
+            provider_label = getattr(self, "provider", None) or getattr(self, "model", None)
+        if not provider_label:
+            provider_label = "unknown"
+
+        # Resolve base_url from the credential pool — keyed on provider_label.
+        try:
+            import json as _json
+            _auth_path = hermes_home / "auth.json"
+            if _auth_path.exists():
+                _auth = _json.loads(_auth_path.read_text())
+                _pool = _auth.get("credential_pool", {}) or {}
+                # Exact key match first, then case-insensitive, then
+                # "custom:<host>" entries that resolve to this provider.
+                _key = None
+                _norm = provider_label.lower()
+                for _k in _pool:
+                    if _k.lower() == _norm:
+                        _key = _k
+                        break
+                if not _key:
+                    for _k in _pool:
+                        if _k.lower().endswith(":" + _norm):
+                            _key = _k
+                            break
+                if _key and isinstance(_pool[_key], list) and _pool[_key]:
+                    _entries = _pool[_key]
+                    # Pick the first entry with a base_url.
+                    for _e in _entries:
+                        if isinstance(_e, dict) and _e.get("base_url"):
+                            live_base_url = _e["base_url"]
+                            break
+        except Exception:
+            pass
+
+        # Fall back to the live agent's base_url if the pool lookup failed.
+        if not live_base_url and self.agent:
+            live_base_url = getattr(self.agent, "base_url", None)
+        if not live_base_url:
+            live_base_url = getattr(self, "base_url", None)
+
+        # Derive the hostname for base_url matching.  Falls back to None when
+        # no URL is available (e.g. a provider with no endpoint), in which case
+        # only the provider-label match is used.
+        live_host = None
+        if live_base_url:
+            try:
+                live_host = (urlparse(str(live_base_url)).hostname or "").lower().rstrip(".") or None
+            except Exception:
+                live_host = None
+
+        # Collect live (in-process) token counters from the active agent.
+        # These always belong to the current provider, so when filtering by
+        # provider they are only merged when the current provider is selected.
+        active_tokens = None
+        if self.agent:
+            cr = getattr(self.agent, "session_cache_read_tokens", 0) or 0
+            cw = getattr(self.agent, "session_cache_write_tokens", 0) or 0
+            fi = getattr(self.agent, "session_input_tokens", 0) or 0
+            ot = getattr(self.agent, "session_output_tokens", 0) or 0
+            ac = getattr(self.agent, "session_api_calls", 0) or 0
+            if cr or fi:
+                active_tokens = {"cread": cr, "cwrite": cw, "fresh_in": fi, "out": ot, "apicalls": ac}
+
+        now_ts = time.time()
+        conn = sqlite3.connect(str(state_db))
+
+        # Provider filter for the SQL queries.  When ``show_all`` is set, no
+        # filter is applied.  Otherwise the query matches sessions whose
+        # ``billing_provider`` equals the current label OR whose
+        # ``billing_base_url`` hostname matches the current base_url hostname.
+        # The OR-with-hostname is the key fix: it folds together historical
+        # sessions that used the same upstream API under a different provider
+        # label (custom → neuralwatt, custom → opencode-go, etc.) and
+        # trailing-slash URL variants.
+        if show_all:
+            provider_where = ""
+            provider_params = []
+        elif live_host:
+            provider_where = (
+                "AND (billing_provider = ? "
+                "OR LOWER(TRIM(billing_base_url, '/')) LIKE ?)"
+            )
+            # Match the hostname anywhere in the URL — LIKE wildcards catch
+            # https://host/v1, https://host/v1/, and any path variant.
+            provider_params = [provider_label, f"%{live_host}%"]
+        else:
+            provider_where = "AND billing_provider = ?"
+            provider_params = [provider_label]
+
+        def _query_window(seconds_back):
+            cutoff = now_ts - seconds_back
+            row = conn.execute(f"""
+                SELECT
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COUNT(*),
+                    COALESCE(SUM(api_call_count), 0)
+                FROM sessions
+                WHERE started_at >= ? {provider_where}
+            """, (cutoff, *provider_params)).fetchone()
+            cread, cwrite, fresh_in, out, sessions, apicalls = row
+            # Active sessions are already counted by the query above — their
+            # DB rows carry accurate per-call-delta counts written on every
+            # API call (agent/conversation_loop.py).  Do NOT merge the live
+            # in-process counters here: that would double-count the current
+            # session (its DB row and the live counter track the same tokens).
+            total = cread + cwrite + fresh_in
+            coverage = (cread / total * 100) if total > 0 else None
+            return cread, cwrite, fresh_in, out, sessions, apicalls, coverage
+
+        def _hourly_buckets(hours):
+            cutoff = now_ts - hours * 3600
+            rows = conn.execute(f"""
+                SELECT started_at, cache_read_tokens, cache_write_tokens, input_tokens
+                FROM sessions
+                WHERE started_at >= ? {provider_where}
+                ORDER BY started_at ASC
+            """, (cutoff, *provider_params)).fetchall()
+            buckets = defaultdict(lambda: {"cread": 0, "cwrite": 0, "fresh_in": 0, "count": 0})
+            for r in rows:
+                hour_ts = int(r[0] // 3600 * 3600)
+                buckets[hour_ts]["cread"] += r[1] or 0
+                buckets[hour_ts]["cwrite"] += r[2] or 0
+                buckets[hour_ts]["fresh_in"] += r[3] or 0
+                buckets[hour_ts]["count"] += 1
+            result = []
+            for hour_ts in sorted(buckets):
+                b = buckets[hour_ts]
+                total = b["cread"] + b["cwrite"] + b["fresh_in"]
+                cov = (b["cread"] / total * 100) if total > 0 else None
+                result.append({"hour_ts": hour_ts, "coverage": cov, "cread": b["cread"], "fresh_in": b["fresh_in"], "sessions": b["count"]})
+            return result
+
+        w = 52
+        if show_all:
+            scope = "ALL providers"
+        elif live_host:
+            scope = f"provider: {provider_label} (host: {live_host})"
+        else:
+            scope = f"provider: {provider_label}"
+        print(f"  {'─' * w}")
+        print(f"  Cache Hit Rate — {scope}")
+        print(f"  {'─' * w}")
+        print()
+
+        windows = [("5 hours", 5 * 3600), ("7 days", 7 * 86400), ("30 days", 30 * 86400)]
+        for label, secs in windows:
+            cread, cwrite, fresh_in, out, sessions, apicalls, coverage = _query_window(secs)
+            cov_str = f"{coverage:.1f}%" if coverage is not None else "n/a"
+            total_rd = cread + cwrite + fresh_in
+            _tr = format_token_count_compact(total_rd)
+            _cr = format_token_count_compact(cread)
+            _fi = format_token_count_compact(fresh_in)
+            print(f"  {label:12s}  coverage={cov_str:>7s}  sessions={sessions:>3d}  api_calls={apicalls:>5d}  total_rd={_tr:>8s}  cache_rd={_cr:>8s}  fresh={_fi:>8s}")
+
+        print()
+
+        # 5h trend sparkline
+        buckets = _hourly_buckets(5)
+        if buckets:
+            recent = buckets[-5:]
+            spark_map = [(95, "█"), (90, "▇"), (80, "▆"), (70, "▅"), (50, "▃"), (1, "▁")]
+            bars = []
+            for b in recent:
+                cov = b["coverage"]
+                if cov is None:
+                    bars.append("·")
+                else:
+                    bar = "·"
+                    for threshold, char in spark_map:
+                        if cov >= threshold:
+                            bar = char
+                            break
+                    bars.append(bar)
+            spark = "".join(bars)
+            arrow = ""
+            if len(recent) >= 2:
+                prev = recent[-2]["coverage"]
+                last = recent[-1]["coverage"]
+                if prev is not None and last is not None:
+                    delta = last - prev
+                    if delta > 2:
+                        arrow = "↗"
+                    elif delta < -2:
+                        arrow = "↘"
+                    else:
+                        arrow = "→"
+            print(f"  5h trend:  {spark} {arrow}")
+            print()
+            print(f"  {'Hour':>6s}  {'Cov':>6s}  {'Cache Rd':>12s}  {'Fresh In':>10s}  {'Sess':>4s}")
+            for b in recent:
+                dt = datetime.fromtimestamp(b["hour_ts"]).strftime("%H:00")
+                cov = b["coverage"]
+                cov_str = f"{cov:.1f}%" if cov is not None else "n/a"
+                _hcr = format_token_count_compact(b['cread'])
+                _hfi = format_token_count_compact(b['fresh_in'])
+                print(f"  {dt:>6s}  {cov_str:>6s}  {_hcr:>8s}  {_hfi:>8s}  {b['sessions']:>4d}")
+        else:
+            if active_tokens:
+                cr = active_tokens["cread"]
+                fi = active_tokens["fresh_in"]
+                total = cr + fi
+                cov = (cr / total * 100) if total > 0 else None
+                cov_str = f"{cov:.1f}%" if cov is not None else "n/a"
+                print(f"  5h trend:  (current session only)")
+                print()
+                _fcr = format_token_count_compact(cr)
+                _ffi = format_token_count_compact(fi)
+                print(f"  Current session  coverage={cov_str:>7s}  cache_rd={_fcr:>8s}  fresh={_ffi:>8s}  api_calls={active_tokens['apicalls']:>5d}")
+            else:
+                print("  No session data in the last 5 hours.")
+
+        conn.close()
+        print(f"  {'─' * w}")
 
     def _show_insights(self, command: str = "/insights"):
         """Show usage insights and analytics from session history."""
@@ -14588,6 +15127,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _run_cleanup()
             self._print_exit_summary()
             self._release_active_session()
+            # NOTE: the /exit --hgm HGM-review spawn happens in
+            # process_command() via _spawn_hgm_review() (local patch #5), not
+            # here — this finally runs too late (after _run_cleanup) and was
+            # observed not to reach a late spawn line reliably.
 
         # Deferred relaunch: /update sets _pending_relaunch so the exec
         # happens here — after prompt_toolkit has exited and fully restored

@@ -191,6 +191,18 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="https://api.gmi-serving.com/v1",
         base_url_env_var="GMI_BASE_URL",
     ),
+    "neuralwatt": HermesOverlay(
+        transport="openai_chat",
+        extra_env_vars=("NEURALWATT_API_KEY",),
+        base_url_override="https://api.neuralwatt.com/v1",
+        base_url_env_var="NEURALWATT_BASE_URL",
+    ),
+    "wafer": HermesOverlay(
+        transport="openai_chat",
+        extra_env_vars=("WAFER_API_KEY",),
+        base_url_override="https://pass.wafer.ai/v1",
+        base_url_env_var="WAFER_BASE_URL",
+    ),
     "ollama-cloud": HermesOverlay(
         transport="openai_chat",
         base_url_override="https://ollama.com/v1",
@@ -338,6 +350,14 @@ ALIASES: Dict[str, str] = {
     "gmi-cloud": "gmi",
     "gmicloud": "gmi",
 
+    # neuralwatt
+    "neural-watt": "neuralwatt",
+    "neuralwatt-ai": "neuralwatt",
+
+    # wafer
+    "wafer-ai": "wafer",
+    "waferai": "wafer",
+
     # Local server aliases → virtual "local" concept (resolved via user config)
     "lmstudio": "lmstudio",
     "lm-studio": "lmstudio",
@@ -361,6 +381,8 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "stepfun": "StepFun Step Plan",
     "xiaomi": "Xiaomi MiMo",
     "gmi": "GMI Cloud",
+    "neuralwatt": "Neuralwatt",
+    "wafer": "Wafer AI",
     "tencent-tokenhub": "Tencent TokenHub",
     "lmstudio": "LM Studio",
     "local": "Local endpoint",

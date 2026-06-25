@@ -55,7 +55,12 @@ from agent.model_metadata import (
 )
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.retry_utils import jittered_backoff
+from agent.retry_utils import (
+    jittered_backoff,
+    maybe_notify_rate_limit_fallback,
+    persistent_rate_limit_backoff,
+    rate_limit_fallback_stage,
+)
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -3410,6 +3415,17 @@ def run_conversation(
                         "error": _nonretryable_summary,
                     }
 
+                if (
+                    retry_count >= max_retries
+                    and is_rate_limited
+                    and classified.reason == FailoverReason.rate_limit
+                ):
+                    # Persistent 429 policy: do not fully stop on rate limits.
+                    # Extend the retry budget one attempt at a time so the
+                    # normal sleep/retry path below keeps running forever:
+                    # 5 quick retries, then ~15m waits, then ~hourly waits.
+                    max_retries = retry_count + 1
+
                 if retry_count >= max_retries:
                     # Before falling back, try rebuilding the primary
                     # client once for transient transport errors (stale
@@ -3525,7 +3541,7 @@ def run_conversation(
                         "failure_reason": classified.reason.value,
                     }
 
-                # For rate limits, respect the Retry-After header if present
+                # For rate limits, respect Retry-After as a floor when present.
                 _retry_after = None
                 if is_rate_limited:
                     _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
@@ -3533,12 +3549,33 @@ def run_conversation(
                         _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
                         if _ra_raw:
                             try:
-                                _retry_after = min(float(_ra_raw), 120)  # Cap at 2 minutes
+                                _retry_after = float(_ra_raw)
                             except (TypeError, ValueError):
                                 pass
-                wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                if is_rate_limited and classified.reason == FailoverReason.rate_limit:
+                    wait_time = persistent_rate_limit_backoff(
+                        retry_count,
+                        retry_after=_retry_after,
+                    )
+                    _rate_stage = rate_limit_fallback_stage(retry_count)
+                    maybe_notify_rate_limit_fallback(
+                        provider=str(_provider),
+                        model=str(_model),
+                        attempt=retry_count,
+                        wait_time=wait_time,
+                        stage=_rate_stage,
+                    )
+                else:
+                    wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                    _rate_stage = None
                 if is_rate_limited:
-                    agent._buffer_status(f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries})...")
+                    if _rate_stage and _rate_stage != "quick_retry":
+                        agent._buffer_status(
+                            f"⏱️ Rate limited. Persistent fallback {_rate_stage}; "
+                            f"waiting {wait_time:.1f}s (attempt {retry_count}/{max_retries})..."
+                        )
+                    else:
+                        agent._buffer_status(f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
                 else:
                     agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
                 logger.warning(
