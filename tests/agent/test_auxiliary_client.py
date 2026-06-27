@@ -26,6 +26,7 @@ from agent.auxiliary_client import (
     _refresh_nous_recommended_model,
     _normalize_aux_provider,
     _try_payment_fallback,
+    _try_configured_fallback_chain,
     _resolve_auto,
     _resolve_xai_oauth_for_aux,
     _CodexCompletionsAdapter,
@@ -1807,7 +1808,8 @@ class TestAuxiliaryFallbackLayering:
 
         assert main_chain_client.chat.completions.create.called
         mock_task_chain.assert_called_once_with(
-            "title_generation", "auto", reason="payment error")
+            "title_generation", "auto", reason="payment error",
+            failed_model="qwen/qwen3.5-122b-a10b")
         mock_main_chain.assert_called_once_with(
             "title_generation", "auto", reason="payment error")
         mock_builtin_chain.assert_not_called()
@@ -1842,6 +1844,63 @@ class TestAuxiliaryFallbackLayering:
         assert chain_client.chat.completions.create.called
         # Main agent fallback should NOT have been consulted — chain succeeded first
         main_called.assert_not_called()
+
+    def test_explicit_provider_rate_limit_uses_configured_chain(self, monkeypatch):
+        """Explicit aux providers should use fallback_chain on 429 rate limits."""
+        class RateLimitError(Exception):
+            status_code = 429
+
+        primary_client = MagicMock()
+        rate_err = RateLimitError("Rate limit exceeded, try again later")
+        primary_client.chat.completions.create.side_effect = rate_err
+
+        chain_client = MagicMock()
+        chain_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from configured chain"))
+        ])
+
+        main_called = MagicMock()
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "meta/llama-3.2-3b-instruct")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("nvidia", "meta/llama-3.2-3b-instruct", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(chain_client, "liquid/lfm-2.5-1.2b-instruct:free", "fallback_chain[0](openrouter)")) as mock_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                   side_effect=main_called):
+            result = call_llm(
+                task="title_generation",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert chain_client.chat.completions.create.called
+        mock_chain.assert_called_once_with(
+            "title_generation", "nvidia", reason="rate limit",
+            failed_model="meta/llama-3.2-3b-instruct")
+        main_called.assert_not_called()
+
+    def test_configured_chain_allows_same_provider_different_model(self):
+        """A model-specific failure can fall back to another model on same provider."""
+        first_duplicate = {"provider": "openrouter", "model": "openrouter/owl-alpha"}
+        same_provider_next_model = {
+            "provider": "openrouter",
+            "model": "nvidia/nemotron-3-nano-30b-a3b:free",
+        }
+        chain_client = MagicMock()
+
+        with patch("agent.auxiliary_client._get_auxiliary_task_config",
+                   return_value={"fallback_chain": [first_duplicate, same_provider_next_model]}), \
+             patch("agent.auxiliary_client._resolve_fallback_entry",
+                   return_value=(chain_client, "nvidia/nemotron-3-nano-30b-a3b:free")) as mock_resolve:
+            client, model, label = _try_configured_fallback_chain(
+                "compression", "openrouter", reason="rate limit",
+                failed_model="openrouter/owl-alpha")
+
+        assert client is chain_client
+        assert model == "nvidia/nemotron-3-nano-30b-a3b:free"
+        assert label == "fallback_chain[1](openrouter)"
+        mock_resolve.assert_called_once_with(same_provider_next_model)
 
     def test_explicit_provider_falls_back_to_main_when_chain_exhausted(self, monkeypatch):
         """If configured fallback_chain returns nothing, main agent model is tried next."""
