@@ -1959,6 +1959,24 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Optional per-task routing overlays. A route only applies when its
+        # classifier matches; otherwise subagents use the base delegation
+        # provider/model above (or inherit the parent when blank). Currently
+        # supported: routes.coding for implementation/build/refactor/debug/test
+        # tasks. Example:
+        # routes:
+        #   coding:
+        #     provider: openai-codex
+        #     model: gpt-5.3-codex-spark
+        "routes": {
+            "coding": {
+                "provider": "",
+                "model": "",
+                "base_url": "",
+                "api_key": "",
+                "api_mode": "",
+            },
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

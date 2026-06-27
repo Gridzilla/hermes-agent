@@ -22,6 +22,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 import os
+import re
 import threading
 import time
 from concurrent.futures import (
@@ -2152,15 +2153,9 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    # Resolve delegation credentials after task normalization. Routing can be
+    # task-class-specific (for example delegation.routes.coding), so resolution
+    # happens per task below instead of once for the whole call.
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -2199,6 +2194,16 @@ def delegate_task(
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
+    # Resolve each task's route before constructing any child. If task 2 has a
+    # bad routed provider, fail before task 1 is registered as a live child.
+    task_creds = []
+    for t in task_list:
+        task_cfg = _select_delegation_config_for_task(cfg, t)
+        try:
+            task_creds.append(_resolve_delegation_credentials(task_cfg, parent_agent))
+        except ValueError as exc:
+            return tool_error(str(exc))
+
     overall_start = time.monotonic()
     results = []
 
@@ -2223,6 +2228,7 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            creds = task_creds[i]
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2559,12 +2565,14 @@ def delegate_task(
                     pass
 
         _goals = [t["goal"] for t in task_list]
+        _models = {getattr(c, "model", None) for c in _child_agents}
+        _dispatch_model = next(iter(_models)) if len(_models) == 1 else "mixed"
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
             toolsets=toolsets,
             role=top_role,
-            model=creds["model"],
+            model=_dispatch_model,
             session_key=_session_key,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
@@ -2692,6 +2700,165 @@ def _resolve_child_credential_pool(
             exc,
         )
     return None
+
+
+_CODING_ROUTE_STRONG_KEYWORDS = (
+    "implement",
+    "coding",
+    "refactor",
+    "debug",
+    "fix bug",
+    "fix the bug",
+    "write tests",
+    "write unit tests",
+    "write integration tests",
+    "write a test",
+    "add tests",
+    "add test",
+    "add a test",
+    "test coverage",
+    "run tests",
+    "run test",
+    "run unit tests",
+    "run npm test",
+    "run the test",
+    "make tests pass",
+    "failing test",
+    "fix failing test",
+    "fix the failing test",
+    "test suite",
+    "unit test",
+    "unit tests",
+    "integration test",
+    "integration tests",
+    "pytest",
+    "run build",
+    "run the build",
+    "build project",
+    "build the project",
+    "compile",
+    "typecheck",
+)
+_CODING_ROUTE_BROAD_KEYWORDS = (
+    "build",
+    "code",
+    "fix",
+    "modify",
+    "update",
+    "add",
+    "create",
+    "change",
+    "patch",
+    "repair",
+    "test",
+)
+_CODING_ROUTE_SOFTWARE_TERMS = (
+    "api",
+    "app",
+    "backend",
+    "bug",
+    "class",
+    "cli",
+    "component",
+    "endpoint",
+    "feature",
+    "form",
+    "frontend",
+    "function",
+    "module",
+    "package",
+    "parser",
+    "repo",
+    "repository",
+    "service",
+    "tests",
+)
+
+
+_REVIEW_INTENT_PREFIXES = (
+    "review ",
+    "reviewer ",
+    "audit ",
+    "critique ",
+    "code review ",
+    "please review ",
+    "perform a code review ",
+    "perform code review ",
+    "do a review ",
+    "do a security review ",
+    "security review ",
+    "adversarial review",
+)
+_REVIEW_INTENT_LEADING_VERBS = ("check", "find", "analyze", "analyse", "inspect", "look for")
+_REVIEW_INTENT_OBJECTS = ("code", "diff", "patch", "bug", "bugs", "logic error", "security issue")
+
+
+def _contains_route_keyword(text: str, keywords: tuple[str, ...]) -> bool:
+    """Match route keywords on token/phrase boundaries.
+
+    Raw substring checks make non-code words look like software terms (``api``
+    in ``capital``, ``cli`` in ``climate``, ``app`` in ``Apple``). Treat letters,
+    digits, underscores, and hyphens as word characters so route terms only
+    match standalone tokens or exact phrases.
+    """
+    for keyword in keywords:
+        pattern = rf"(?<![a-z0-9_-]){re.escape(keyword)}(?![a-z0-9_-])"
+        if re.search(pattern, text):
+            return True
+    return False
+
+
+def _task_is_review_intent(text: str) -> bool:
+    stripped = text.strip().lower()
+    if any(stripped.startswith(prefix) for prefix in _REVIEW_INTENT_PREFIXES):
+        return True
+    return any(
+        stripped.startswith(verb)
+        and _contains_route_keyword(stripped, _REVIEW_INTENT_OBJECTS)
+        for verb in _REVIEW_INTENT_LEADING_VERBS
+    )
+
+
+def _task_looks_like_coding(task: dict) -> bool:
+    """Conservative heuristic for routing implementation tasks.
+
+    The route is intentionally opt-in via ``delegation.routes.coding`` and is
+    applied only when the delegated task itself looks like code work. Toolsets
+    alone are too broad (``file`` can mean document editing), so routing relies
+    on implementation/test/refactor keywords or broad verbs paired with software
+    terms.
+    """
+    if not isinstance(task, dict):
+        return False
+    goal = str(task.get("goal") or "").lower()
+    context = str(task.get("context") or "").lower()
+    text = f"{goal}\n{context}"
+    if _task_is_review_intent(goal):
+        return False
+    has_strong_keyword = _contains_route_keyword(text, _CODING_ROUTE_STRONG_KEYWORDS)
+    has_broad_keyword = _contains_route_keyword(text, _CODING_ROUTE_BROAD_KEYWORDS)
+    has_software_term = _contains_route_keyword(text, _CODING_ROUTE_SOFTWARE_TERMS)
+    return has_strong_keyword or (has_broad_keyword and has_software_term)
+
+
+def _select_delegation_config_for_task(cfg: dict, task: dict) -> dict:
+    """Return the effective delegation config for one task.
+
+    ``delegation.routes.coding`` overlays the base delegation config only for
+    tasks that look like implementation/build/refactor/debug/test work. This
+    lets users reserve a coding-plan model (for example OpenAI Codex Spark) for
+    coding subagents while non-coding delegation inherits the parent or uses the
+    base ``delegation.provider``/``delegation.model``.
+    """
+    selected = dict(cfg or {})
+    routes = selected.get("routes") or {}
+    coding_route = routes.get("coding") if isinstance(routes, dict) else None
+    if isinstance(coding_route, dict) and _task_looks_like_coding(task):
+        for key in ("model", "provider", "base_url", "api_key", "api_mode"):
+            value = coding_route.get(key)
+            if value not in (None, ""):
+                selected[key] = value
+    return selected
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -2935,7 +3102,7 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "- Subagent model is not selected by a delegate_task argument. Children inherit the parent model (plus its fallback chain) unless configured via delegation.provider / delegation.model, or routed per task with delegation.routes.coding for coding/build/refactor/debug/fix/test work.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )

@@ -32,6 +32,7 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _select_delegation_config_for_task,
 )
 
 
@@ -926,6 +927,256 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertIsNone(creds["api_key"])
         self.assertIsNone(creds["api_mode"])
         self.assertIsNone(creds["model"])
+
+    def test_coding_route_applies_to_terminal_file_task(self):
+        cfg = {
+            "model": "",
+            "provider": "",
+            "routes": {
+                "coding": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.3-codex-spark",
+                }
+            },
+        }
+        task = {"goal": "Implement the parser", "toolsets": ["terminal", "file"]}
+
+        selected = _select_delegation_config_for_task(cfg, task)
+
+        self.assertEqual(selected["provider"], "openai-codex")
+        self.assertEqual(selected["model"], "gpt-5.3-codex-spark")
+
+    def test_coding_route_does_not_apply_to_research_task(self):
+        cfg = {
+            "model": "",
+            "provider": "",
+            "routes": {
+                "coding": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.3-codex-spark",
+                }
+            },
+        }
+        task = {"goal": "Research market structure sources", "toolsets": ["web"]}
+
+        selected = _select_delegation_config_for_task(cfg, task)
+
+        self.assertEqual(selected.get("provider"), "")
+        self.assertEqual(selected.get("model"), "")
+
+    def test_coding_route_goal_keywords_work_without_explicit_toolsets(self):
+        cfg = {
+            "provider": "",
+            "routes": {
+                "coding": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.3-codex-spark",
+                }
+            },
+        }
+        task = {"goal": "Refactor the authentication module and add tests"}
+
+        selected = _select_delegation_config_for_task(cfg, task)
+
+        self.assertEqual(selected["provider"], "openai-codex")
+        self.assertEqual(selected["model"], "gpt-5.3-codex-spark")
+
+    def test_blank_coding_route_preserves_base_delegation(self):
+        cfg = {
+            "provider": "openrouter",
+            "model": "cheap-coder",
+            "routes": {
+                "coding": {
+                    "provider": "",
+                    "model": "",
+                    "base_url": "",
+                    "api_key": "",
+                    "api_mode": "",
+                }
+            },
+        }
+        task = {"goal": "Implement parser support"}
+
+        selected = _select_delegation_config_for_task(cfg, task)
+
+        self.assertEqual(selected["provider"], "openrouter")
+        self.assertEqual(selected["model"], "cheap-coder")
+
+    def test_code_review_feedback_task_still_routes_as_coding(self):
+        cfg = {
+            "provider": "",
+            "routes": {
+                "coding": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.3-codex-spark",
+                }
+            },
+        }
+        task = {"goal": "Implement code review feedback and refactor auth"}
+
+        selected = _select_delegation_config_for_task(cfg, task)
+
+        self.assertEqual(selected["provider"], "openai-codex")
+        self.assertEqual(selected["model"], "gpt-5.3-codex-spark")
+
+    def test_coding_route_does_not_apply_to_review_task(self):
+        cfg = {
+            "model": "",
+            "provider": "",
+            "routes": {
+                "coding": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.3-codex-spark",
+                }
+            },
+        }
+        for goal in (
+            "Review this code diff for logic errors",
+            "Code review this diff",
+            "Please review this code",
+            "Do a security review of this patch",
+            "Check this code for bugs",
+            "Find bugs in this code",
+            "Perform a code review of the parser",
+        ):
+            with self.subTest(goal=goal):
+                task = {"goal": goal, "toolsets": ["terminal", "file"]}
+
+                selected = _select_delegation_config_for_task(cfg, task)
+
+                self.assertEqual(selected.get("provider"), "")
+                self.assertEqual(selected.get("model"), "")
+
+    def test_broad_build_non_software_task_does_not_route_as_coding(self):
+        cfg = {
+            "model": "",
+            "provider": "",
+            "routes": {
+                "coding": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.3-codex-spark",
+                }
+            },
+        }
+        for goal, toolsets in (
+            ("Build a market research brief", ["web"]),
+            ("Build a market research brief", ["terminal", "file"]),
+            ("Fix grammar in the proposal", ["terminal", "file"]),
+            ("Fix a typo in the document", ["terminal", "file"]),
+            ("Build a capital markets brief", ["terminal", "file"]),
+            ("Update climate report", ["terminal", "file"]),
+            ("Update Apple earnings", ["terminal", "file"]),
+            ("Test the market thesis", ["terminal", "file"]),
+        ):
+            with self.subTest(goal=goal, toolsets=toolsets):
+                task = {"goal": goal, "toolsets": toolsets}
+
+                selected = _select_delegation_config_for_task(cfg, task)
+
+                self.assertEqual(selected.get("provider"), "")
+                self.assertEqual(selected.get("model"), "")
+
+    def test_broad_build_software_task_routes_as_coding(self):
+        cfg = {
+            "model": "",
+            "provider": "",
+            "routes": {
+                "coding": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.3-codex-spark",
+                }
+            },
+        }
+        for goal in (
+            "Build a REST API service",
+            "Run build",
+            "Run the build",
+            "Build project",
+            "Build the project",
+            "Fix the parser",
+            "Fix parser bug",
+            "Fix failing tests",
+            "Fix failing test",
+            "Fix the failing test",
+            "Run tests",
+            "Run unit tests",
+            "Run npm test",
+            "Run test",
+            "Add test coverage",
+            "Write a test",
+            "Add a test",
+            "Write unit tests",
+            "Write integration tests",
+            "Test the CLI",
+            "Run the test suite",
+            "Make tests pass",
+            "Modify the parser to support arrays",
+            "Update the API endpoint to return metadata",
+            "Add a login form component",
+            "Create a CLI command for profiles",
+            "Change the backend service to use retries",
+            "Patch the failing parser behavior",
+            "Repair failing tests",
+        ):
+            with self.subTest(goal=goal):
+                task = {"goal": goal, "toolsets": ["terminal", "file"]}
+
+                selected = _select_delegation_config_for_task(cfg, task)
+
+                self.assertEqual(selected["provider"], "openai-codex")
+                self.assertEqual(selected["model"], "gpt-5.3-codex-spark")
+
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    @patch("tools.delegate_tool._load_config")
+    def test_batch_routes_only_coding_tasks_to_coding_model(
+        self, mock_load_config, mock_resolve, mock_build, mock_run
+    ):
+        mock_load_config.return_value = {
+            "model": "",
+            "provider": "",
+            "max_iterations": 50,
+            "routes": {
+                "coding": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.3-codex-spark",
+                }
+            },
+        }
+        mock_resolve.return_value = {
+            "provider": "openai-codex",
+            "model": "gpt-5.3-codex-spark",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-oauth-token",
+            "api_mode": "codex_responses",
+        }
+        child_a = MagicMock(model="gpt-5.3-codex-spark")
+        child_b = MagicMock(model="anthropic/claude-sonnet-4")
+        mock_build.side_effect = [child_a, child_b]
+        mock_run.side_effect = [
+            {"task_index": 0, "status": "completed", "summary": "coded"},
+            {"task_index": 1, "status": "completed", "summary": "researched"},
+        ]
+        parent = _make_mock_parent()
+        tasks = [
+            {"goal": "Implement parser support", "toolsets": ["terminal", "file"]},
+            {"goal": "Research parser theory", "toolsets": ["web"]},
+        ]
+
+        result = json.loads(delegate_task(tasks=tasks, parent_agent=parent))
+
+        self.assertIn("results", result)
+        self.assertEqual(mock_build.call_count, 2)
+        coding_kwargs = mock_build.call_args_list[0].kwargs
+        research_kwargs = mock_build.call_args_list[1].kwargs
+        self.assertEqual(coding_kwargs["model"], "gpt-5.3-codex-spark")
+        self.assertEqual(coding_kwargs["override_provider"], "openai-codex")
+        self.assertIsNone(research_kwargs["model"])
+        self.assertIsNone(research_kwargs["override_provider"])
+        mock_resolve.assert_called_once_with(
+            requested="openai-codex", target_model="gpt-5.3-codex-spark"
+        )
 
     def test_model_only_no_provider(self):
         """When only model is set (no provider), model is returned but credentials are None."""
