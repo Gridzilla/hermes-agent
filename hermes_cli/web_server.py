@@ -917,6 +917,8 @@ def _apply_main_model_assignment(
     and the pool entry is on the registry default, so preserving it here is what
     lets the override actually route. The hardcoded ``context_length`` override
     is always dropped since the new model may have a different context window.
+    Likewise, ``max_context_length`` is an alias for that same model cap and must
+    be cleared on model switches too.
 
     Returns the same dict (coerced to a fresh dict if the input wasn't one) so
     callers can assign it straight back onto the model config.
@@ -946,6 +948,7 @@ def _apply_main_model_assignment(
     if new_provider != prev_provider:
         clear_model_endpoint_credentials(model_cfg, clear_api_key=False)
     model_cfg.pop("context_length", None)
+    model_cfg.pop("max_context_length", None)
     return model_cfg
 
 
@@ -3295,8 +3298,10 @@ def _normalize_config_for_web(config: Dict[str, Any]) -> Dict[str, Any]:
     config = dict(config)  # shallow copy
     model_val = config.get("model")
     if isinstance(model_val, dict):
-        # Extract context_length before flattening the dict
-        ctx_len = model_val.get("context_length", 0)
+        # Extract context_length / max_context_length alias before flattening the dict
+        ctx_len = model_val.get("context_length")
+        if ctx_len is None:
+            ctx_len = model_val.get("max_context_length", 0)
         config["model"] = model_val.get("default", model_val.get("name", ""))
         config["model_context_length"] = ctx_len if isinstance(ctx_len, int) else 0
     else:
@@ -3505,6 +3510,8 @@ def get_model_info(profile: Optional[str] = None):
             provider = model_cfg.get("provider", "")
             base_url = model_cfg.get("base_url", "")
             config_ctx = model_cfg.get("context_length")
+            if config_ctx is None:
+                config_ctx = model_cfg.get("max_context_length")
         else:
             model_name = str(model_cfg) if model_cfg else ""
             provider = ""
@@ -4022,6 +4029,10 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
                     disk_model["context_length"] = ctx_override
                 else:
                     disk_model.pop("context_length", None)
+                # Alias remains runtime-equivalent to context_length.
+                # Keep the dict clean so stale max_context_length does not
+                # leak into config flows that write through the web API.
+                disk_model.pop("max_context_length", None)
                 config["model"] = disk_model
             # Model was previously a bare string — upgrade to dict if
             # user is setting a context_length override

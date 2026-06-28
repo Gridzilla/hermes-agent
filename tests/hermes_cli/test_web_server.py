@@ -2272,8 +2272,9 @@ class TestWebServerEndpoints:
         """The shared main-slot assignment helper must persist a supplied
         base_url, clear a stale base_url only when switching providers, preserve
         it on same-provider re-assignment, and always drop a hardcoded
-        context_length override. Both POST /api/model/set and profile-model
-        writes route through this, so the contract is pinned here."""
+        context_length override (including max_context_length alias). Both POST
+        /api/model/set and profile-model writes route through this, so the
+        contract is pinned here."""
         from hermes_cli.web_server import _apply_main_model_assignment
 
         # Custom + base_url → persisted; stale context_length dropped.
@@ -2284,6 +2285,11 @@ class TestWebServerEndpoints:
         assert out["default"] == "llama-3.1-8b"
         assert out["base_url"] == "http://127.0.0.1:8000/v1"
         assert "context_length" not in out
+        out = _apply_main_model_assignment(
+            {"max_context_length": 4096}, "custom", "llama-3.1-8b", "http://127.0.0.1:8000/v1"
+        )
+        assert "context_length" not in out
+        assert "max_context_length" not in out
 
         # Switching providers (custom → openrouter) → stale base_url cleared.
         out = _apply_main_model_assignment(
@@ -3845,6 +3851,21 @@ class TestModelContextLength:
         result = _normalize_config_for_web(cfg)
         assert result["model_context_length"] == 0
 
+    def test_normalize_extracts_max_context_length_alias(self):
+        """normalize should surface max_context_length as model_context_length."""
+        from hermes_cli.web_server import _normalize_config_for_web
+
+        cfg = {
+            "model": {
+                "default": "anthropic/claude-opus-4.6",
+                "provider": "openrouter",
+                "max_context_length": 262_144,
+            }
+        }
+        result = _normalize_config_for_web(cfg)
+        assert result["model"] == "anthropic/claude-opus-4.6"
+        assert result["model_context_length"] == 262_144
+
     def test_denormalize_writes_context_length_into_model_dict(self):
         """denormalize should write model_context_length back into model dict."""
         from hermes_cli.web_server import _denormalize_config_from_web
@@ -3882,6 +3903,26 @@ class TestModelContextLength:
         })
         assert isinstance(result["model"], dict)
         assert "context_length" not in result["model"]
+
+    def test_denormalize_zero_clears_max_context_length_alias(self):
+        """denormalize with model_context_length=0 should clear stale max_context_length."""
+        from hermes_cli.web_server import _denormalize_config_from_web
+        from hermes_cli.config import save_config
+
+        save_config({
+            "model": {
+                "default": "anthropic/claude-opus-4.6",
+                "provider": "openrouter",
+                "max_context_length": 50000,
+            }
+        })
+
+        result = _denormalize_config_from_web({
+            "model": "anthropic/claude-opus-4.6",
+            "model_context_length": 0,
+        })
+        assert isinstance(result["model"], dict)
+        assert "max_context_length" not in result["model"]
 
     def test_denormalize_upgrades_bare_string_to_dict(self):
         """denormalize should upgrade bare string model to dict when context_length set."""

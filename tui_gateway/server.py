@@ -2307,8 +2307,12 @@ def _apply_model_switch(
             _cfg_ctx = None
             if isinstance(cfg, dict):
                 _mc = cfg.get("model", {})
-                if isinstance(_mc, dict) and _mc.get("context_length") is not None:
-                    _cfg_ctx = int(_mc["context_length"])
+                if isinstance(_mc, dict):
+                    _raw_ctx = _mc.get("context_length")
+                    if _raw_ctx is None:
+                        _raw_ctx = _mc.get("max_context_length")
+                    if _raw_ctx is not None:
+                        _cfg_ctx = int(_raw_ctx)
             merge_preflight_compression_warning(
                 result,
                 agent=agent,

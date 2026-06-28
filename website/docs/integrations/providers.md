@@ -272,6 +272,17 @@ Base URLs can be overridden with `NOVITA_BASE_URL`, `GLM_BASE_URL`, `KIMI_BASE_U
 When using the Z.AI / GLM provider, Hermes automatically probes multiple endpoints (global, China, coding variants) to find one that accepts your API key. You don't need to set `GLM_BASE_URL` manually — the working endpoint is detected and cached automatically.
 :::
 
+GLM-5.2 advertises a 1M-token context window. If you want Hermes to compress sooner or avoid sending very large prompts through the native Z.AI provider, cap the window in `config.yaml`:
+
+```yaml
+model:
+  provider: zai
+  default: glm-5.2
+  max_context_length: 262144  # cap Hermes below the model's 1M default
+```
+
+`model.context_length` remains supported and has the same effect; `max_context_length` is a clearer alias when your intent is to cap an otherwise-correct provider default rather than fix wrong auto-detection.
+
 ### xAI (Grok) — Responses API + Prompt Caching
 
 xAI is wired through the Responses API (`codex_responses` transport) for automatic reasoning support on Grok 4 models — no `reasoning_effort` parameter needed, the server reasons by default. Set `XAI_API_KEY` in `~/.hermes/.env` and pick xAI in `hermes model`, or drop `grok` as a shortcut into `/model grok-4-fast-reasoning`.
@@ -1105,7 +1116,7 @@ Set `model.max_tokens` only when you need to limit how long individual responses
 
 Hermes uses a multi-source resolution chain to detect the correct context window for your model and provider:
 
-1. **Config override** — `model.context_length` in config.yaml (highest priority)
+1. **Config override** — `model.context_length` in config.yaml, or `model.max_context_length` as a clearer alias when you are intentionally capping a larger detected window (highest priority)
 2. **Custom provider per-model** — `custom_providers[].models.<id>.context_length`
 3. **Persistent cache** — previously discovered values (survives restarts)
 4. **Endpoint `/models`** — queries your server's API (local/custom endpoints)
@@ -1124,6 +1135,15 @@ model:
   default: "qwen3.5:9b"
   base_url: "http://localhost:8080/v1"
   context_length: 131072  # tokens
+```
+
+If your goal is to cap a provider's otherwise-correct large default, you can use the clearer alias `max_context_length` instead:
+
+```yaml
+model:
+  provider: zai
+  default: glm-5.2
+  max_context_length: 262144
 ```
 
 For custom endpoints, you can also set context length per model:

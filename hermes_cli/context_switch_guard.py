@@ -145,8 +145,12 @@ def enrich_model_switch_warnings_for_gateway(
         try:
             cfg = load_gateway_config()
             model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
-            if isinstance(model_cfg, dict) and model_cfg.get("context_length") is not None:
-                cfg_ctx = int(model_cfg["context_length"])
+            if isinstance(model_cfg, dict):
+                raw_ctx = model_cfg.get("context_length")
+                if raw_ctx is None:
+                    raw_ctx = model_cfg.get("max_context_length")
+                if raw_ctx is not None:
+                    cfg_ctx = int(raw_ctx)
         except Exception:
             pass
 

@@ -500,7 +500,11 @@ class GatewaySlashCommandsMixin:
                 provider_name = _clean_str(model_cfg.get("provider"))
         if not context_total:
             model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
-            configured_context = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
+            configured_context = None
+            if isinstance(model_cfg, dict):
+                configured_context = model_cfg.get("context_length")
+                if configured_context is None:
+                    configured_context = model_cfg.get("max_context_length")
             if isinstance(configured_context, int) and configured_context > 0:
                 context_total = configured_context
 
@@ -1292,6 +1296,8 @@ class GatewaySlashCommandsMixin:
                             _sw_model_cfg = _sw_cfg.get("model", {})
                             if isinstance(_sw_model_cfg, dict):
                                 _sw_raw = _sw_model_cfg.get("context_length")
+                                if _sw_raw is None:
+                                    _sw_raw = _sw_model_cfg.get("max_context_length")
                                 if _sw_raw is not None:
                                     _sw_config_ctx = int(_sw_raw)
                         except Exception:
@@ -1518,6 +1524,8 @@ class GatewaySlashCommandsMixin:
                 _sw2_model_cfg = _sw2_cfg.get("model", {})
                 if isinstance(_sw2_model_cfg, dict):
                     _sw2_raw = _sw2_model_cfg.get("context_length")
+                    if _sw2_raw is None:
+                        _sw2_raw = _sw2_model_cfg.get("max_context_length")
                     if _sw2_raw is not None:
                         _sw2_config_ctx = int(_sw2_raw)
             except Exception:

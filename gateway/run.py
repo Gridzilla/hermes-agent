@@ -8783,6 +8783,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _msg_model_cfg = _msg_cfg.get("model", {})
                     if isinstance(_msg_model_cfg, dict):
                         _msg_raw_ctx = _msg_model_cfg.get("context_length")
+                        if _msg_raw_ctx is None:
+                            _msg_raw_ctx = _msg_model_cfg.get("max_context_length")
                         if _msg_raw_ctx is not None:
                             _msg_config_ctx = int(_msg_raw_ctx)
                 except Exception:
@@ -9140,9 +9142,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_model = _model_cfg
                     elif isinstance(_model_cfg, dict):
                         _hyg_model = _model_cfg.get("default") or _model_cfg.get("model") or _hyg_model
-                        # Read explicit context_length override from model config
-                        # (same as run_agent.py lines 995-1005)
+                        # Read explicit context_length override / cap from model config.
                         _raw_ctx = _model_cfg.get("context_length")
+                        if _raw_ctx is None:
+                            _raw_ctx = _model_cfg.get("max_context_length")
                         if _raw_ctx is not None:
                             try:
                                 _hyg_config_context_length = int(_raw_ctx)
@@ -10214,6 +10217,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 model_cfg = data.get("model", {})
                 if isinstance(model_cfg, dict):
                     raw_ctx = model_cfg.get("context_length")
+                    if raw_ctx is None:
+                        raw_ctx = model_cfg.get("max_context_length")
                     if raw_ctx is not None:
                         try:
                             config_context_length = int(raw_ctx)

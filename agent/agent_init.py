@@ -1405,23 +1405,31 @@ def init_agent(
                 )
     agent._session_init_model_config["max_tokens"] = agent.max_tokens
 
-    # Read explicit context_length override from model config
+    # Read explicit context_length override from model config.  ``max_context_length``
+    # is accepted as a user-facing alias for people who think of this as capping
+    # a provider's advertised window (for example GLM-5.2 on Z.AI defaults to 1M).
     if isinstance(_model_cfg, dict):
         _config_context_length = _model_cfg.get("context_length")
+        _context_length_key = "context_length"
+        if _config_context_length is None and _model_cfg.get("max_context_length") is not None:
+            _config_context_length = _model_cfg.get("max_context_length")
+            _context_length_key = "max_context_length"
     else:
         _config_context_length = None
+        _context_length_key = "context_length"
     if _config_context_length is not None:
         try:
             _config_context_length = int(_config_context_length)
         except (TypeError, ValueError):
             _ra().logger.warning(
-                "Invalid model.context_length in config.yaml: %r — "
+                "Invalid model.%s in config.yaml: %r — "
                 "must be a plain integer (e.g. 256000, not '256K'). "
                 "Falling back to auto-detection.",
+                _context_length_key,
                 _config_context_length,
             )
             print(
-                f"\n⚠ Invalid model.context_length in config.yaml: {_config_context_length!r}\n"
+                f"\n⚠ Invalid model.{_context_length_key} in config.yaml: {_config_context_length!r}\n"
                 f"  Must be a plain integer (e.g. 256000, not '256K').\n"
                 f"  Falling back to auto-detected context window.\n",
                 file=sys.stderr,
