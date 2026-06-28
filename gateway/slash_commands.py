@@ -44,6 +44,41 @@ from utils import (
 
 logger = logging.getLogger("gateway.run")
 
+# Upper bound on the off-loop agent-resource cleanup during a /new or /reset
+# (see _handle_reset_command). A stuck teardown must not block the event loop;
+# past this the reset proceeds and the cleanup is left to finish (or leak) in
+# its worker thread. (#35994)
+_RESET_CLEANUP_TIMEOUT_S = 30.0
+
+
+def _model_switch_skew_guard() -> Optional[str]:
+    """Refuse a model switch when the gateway is running stale code.
+
+    A long-lived gateway holds its modules in memory from boot. If the checkout
+    changed underneath it (e.g. a manual ``git pull``), switching models can hit
+    a first-time lazy import on a new code path and crash on a stale cached
+    dependency — the cryptic ``cannot import name 'env_float' from 'utils'``.
+    Detect the drift and tell the user to restart instead.
+
+    Intentionally scoped to model switching — the known, highest-risk trigger.
+    Any first-time lazy import on a stale process is technically exposed; we
+    don't guard every import site, only this one.
+    """
+    from gateway.code_skew import detect_code_skew
+
+    skew = detect_code_skew()
+    if not skew:
+        return None
+    boot_rev, disk_rev = skew
+    return t(
+        "gateway.model.error_prefix",
+        error=(
+            f"This gateway is running code from {boot_rev} but the checkout on "
+            f"disk is now {disk_rev}. Switching models would risk a stale-module "
+            f"crash — restart the gateway to load the new code: hermes gateway restart"
+        ),
+    )
+
 
 class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
@@ -82,13 +117,44 @@ class GatewaySlashCommandsMixin:
         # Close tool resources on the old agent (terminal sandboxes, browser
         # daemons, background processes) before evicting from cache.
         # Guard with getattr because test fixtures may skip __init__.
+        #
+        # _cleanup_agent_resources is synchronous and can block for a long time
+        # (agent.close() does subprocess teardown; shutdown_memory_provider()
+        # may do network IO). This handler runs ON the event loop when a
+        # Telegram/Discord/Slack confirm-button click resolves the slash-confirm
+        # (see _request_slash_confirm), so an inline call wedges the whole loop
+        # and the bot goes silent until restart (#35994). Offload it to a worker
+        # thread (via the contextvar-preserving executor helper) with a bounded
+        # timeout so the loop is never blocked.
         _cache_lock = getattr(self, "_agent_cache_lock", None)
         if _cache_lock is not None:
             with _cache_lock:
                 _cached = self._agent_cache.get(session_key)
                 _old_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
             if _old_agent is not None:
-                self._cleanup_agent_resources(_old_agent)
+                try:
+                    await asyncio.wait_for(
+                        self._run_in_executor_with_context(
+                            self._cleanup_agent_resources, _old_agent
+                        ),
+                        timeout=_RESET_CLEANUP_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    # wait_for cancels the await, but the worker thread cannot be
+                    # cancelled — a wedged teardown keeps running (or leaks) for
+                    # the gateway's lifetime. The reset proceeds regardless.
+                    logger.warning(
+                        "Agent resource cleanup for session %s exceeded %ss during "
+                        "/new reset; proceeding with reset (the worker thread is left "
+                        "to finish on its own). (#35994)",
+                        session_key, _RESET_CLEANUP_TIMEOUT_S,
+                    )
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "Agent resource cleanup for session %s failed during /new "
+                        "reset: %s (#35994)",
+                        session_key, cleanup_exc,
+                    )
         self._evict_cached_agent(session_key)
 
         # Discard any /queue overflow for this session — /new is a
@@ -500,11 +566,7 @@ class GatewaySlashCommandsMixin:
                 provider_name = _clean_str(model_cfg.get("provider"))
         if not context_total:
             model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
-            configured_context = None
-            if isinstance(model_cfg, dict):
-                configured_context = model_cfg.get("context_length")
-                if configured_context is None:
-                    configured_context = model_cfg.get("max_context_length")
+            configured_context = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
             if isinstance(configured_context, int) and configured_context > 0:
                 context_total = configured_context
 
@@ -935,7 +997,15 @@ class GatewaySlashCommandsMixin:
         # us.  The detached subprocess approach (setsid + bash) doesn't work
         # under systemd (KillMode=mixed kills the cgroup) or Docker (tini
         # exits when the gateway dies, taking the detached helper with it).
-        _under_service = bool(os.environ.get("INVOCATION_ID"))  # systemd sets this
+        # systemd sets INVOCATION_ID; launchd sets XPC_SERVICE_NAME to the
+        # job label.  Without the launchd check, macOS /restart takes the
+        # detached path and exits 0, which KeepAlive.SuccessfulExit=false
+        # treats as a deliberate stop — the gateway stays dead until next
+        # login.  Interactive macOS shells inherit XPC_SERVICE_NAME=0, so
+        # "0" must count as not-under-launchd.
+        _under_service = bool(os.environ.get("INVOCATION_ID")) or os.environ.get(
+            "XPC_SERVICE_NAME", "0"
+        ) not in ("", "0")
         _in_container = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
         if _under_service or _in_container:
             self.request_restart(detached=False, via_service=True)
@@ -1063,8 +1133,13 @@ class GatewaySlashCommandsMixin:
             is_global_flag,
             force_refresh,
             is_session,
+            max_context_arg,
         ) = parse_model_flags(raw_args)
         persist_global = resolve_persist_behavior(is_global_flag, is_session)
+        from hermes_cli.context_window import parse_context_window_cap
+        max_context_cap = parse_context_window_cap(max_context_arg)
+        if max_context_arg is not None and max_context_cap is None and str(max_context_arg).strip().lower() != "auto":
+            return t("gateway.model.error_prefix", error=f"Invalid --max-context value: {max_context_arg!r} (use an integer or auto)")
 
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
@@ -1114,6 +1189,71 @@ class GatewaySlashCommandsMixin:
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
 
+        if max_context_arg is not None and not model_input and not explicit_provider:
+            cached_entry = None
+            _cache_lock = getattr(self, "_agent_cache_lock", None)
+            _cache = getattr(self, "_agent_cache", None)
+            if _cache_lock and _cache is not None:
+                with _cache_lock:
+                    cached_entry = _cache.get(session_key)
+            agent = cached_entry[0] if cached_entry and cached_entry[0] is not None else None
+            if agent is not None:
+                agent._config_context_length = max_context_cap
+                if getattr(agent, "context_compressor", None):
+                    from agent.model_metadata import get_model_context_length
+                    ctx_len = get_model_context_length(
+                        getattr(agent, "model", current_model),
+                        base_url=getattr(agent, "base_url", current_base_url) or "",
+                        api_key=getattr(agent, "api_key", "") if isinstance(getattr(agent, "api_key", ""), str) else "",
+                        provider=getattr(agent, "provider", current_provider) or "",
+                        config_context_length=max_context_cap,
+                        custom_providers=custom_provs,
+                    )
+                    agent.context_compressor.update_model(
+                        model=getattr(agent, "model", current_model),
+                        context_length=ctx_len,
+                        base_url=getattr(agent, "base_url", current_base_url) or "",
+                        api_key=getattr(agent, "api_key", "") or "",
+                        provider=getattr(agent, "provider", current_provider) or "",
+                        api_mode=getattr(agent, "api_mode", "") or "",
+                    )
+                ctx_len = getattr(getattr(agent, "context_compressor", None), "context_length", None) or max_context_cap
+            else:
+                ctx_len = max_context_cap
+            override_for_cap = self._session_model_overrides.get(session_key)
+            if not isinstance(override_for_cap, dict):
+                override_for_cap = {
+                    "model": getattr(agent, "model", current_model) if agent is not None else current_model,
+                    "provider": getattr(agent, "provider", current_provider) if agent is not None else current_provider,
+                    "api_key": getattr(agent, "api_key", current_api_key) if agent is not None else current_api_key,
+                    "base_url": getattr(agent, "base_url", current_base_url) if agent is not None else current_base_url,
+                    "api_mode": getattr(agent, "api_mode", "") if agent is not None else "",
+                }
+            if max_context_cap:
+                override_for_cap["max_context_length"] = max_context_cap
+                override_for_cap.pop("context_length", None)
+            else:
+                override_for_cap.pop("max_context_length", None)
+                override_for_cap.pop("context_length", None)
+            self._session_model_overrides[session_key] = override_for_cap
+            if persist_global:
+                try:
+                    from cli import save_config_value
+                    if max_context_cap:
+                        save_config_value("model.max_context_length", max_context_cap)
+                        save_config_value("model.context_length", None)
+                    else:
+                        save_config_value("model.max_context_length", None)
+                        save_config_value("model.context_length", None)
+                except Exception as exc:
+                    logger.warning("Failed to persist model context cap: %s", exc)
+            lines = ["Context cap set: {0:,} tokens".format(max_context_cap) if max_context_cap else "Context cap cleared; using auto-detected context window"]
+            if ctx_len:
+                lines.append(f"Context: {int(ctx_len):,} tokens")
+                lines.append(f"Compress around: {int(ctx_len * 0.5):,} tokens")
+            lines.append(t("gateway.model.saved_global") if persist_global else t("gateway.model.session_only_hint"))
+            return "\n".join(lines)
+
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
             # Try interactive picker if the platform supports it
@@ -1125,13 +1265,18 @@ class GatewaySlashCommandsMixin:
 
             if has_picker:
                 try:
-                    providers = list_picker_providers(
+                    # Offload blocking provider-listing (can fall through to a
+                    # synchronous urllib HTTP fetch on a stale cache) off the
+                    # event loop so the gateway doesn't freeze. See #41289.
+                    providers = await asyncio.to_thread(
+                        list_picker_providers,
                         current_provider=current_provider,
                         current_base_url=current_base_url,
                         current_model=current_model,
                         user_providers=user_provs,
                         custom_providers=custom_provs,
                         max_models=50,
+                        include_moa=True,
                     )
                 except Exception:
                     providers = []
@@ -1150,7 +1295,15 @@ class GatewaySlashCommandsMixin:
                         _chat_id: str, model_id: str, provider_slug: str
                     ) -> str:
                         """Perform the model switch and return confirmation text."""
-                        result = _switch_model(
+                        skew_error = _model_switch_skew_guard()
+                        if skew_error:
+                            return skew_error
+                        # Offload the switch off the event loop — switch_model()
+                        # can fall through to a synchronous models.dev HTTP fetch
+                        # (requests.get, 15s timeout) on a cold/expired cache,
+                        # which freezes the gateway otherwise. See #20525, #41289.
+                        result = await asyncio.to_thread(
+                            _switch_model,
                             raw_input=model_id,
                             current_provider=_cur_provider,
                             current_model=_cur_model,
@@ -1195,6 +1348,7 @@ class GatewaySlashCommandsMixin:
                                     api_key=result.api_key,
                                     base_url=result.base_url,
                                     api_mode=result.api_mode,
+                                    config_context_length=max_context_cap if max_context_arg is not None else None,
                                 )
                             except Exception as exc:
                                 # The in-place swap rolled the agent back to the
@@ -1277,8 +1431,15 @@ class GatewaySlashCommandsMixin:
                                 _persist_model_cfg["provider"] = result.target_provider
                                 if result.base_url:
                                     _persist_model_cfg["base_url"] = result.base_url
+                                if max_context_arg is not None:
+                                    if max_context_cap:
+                                        _persist_model_cfg["max_context_length"] = max_context_cap
+                                        _persist_model_cfg.pop("context_length", None)
+                                    else:
+                                        _persist_model_cfg.pop("max_context_length", None)
+                                        _persist_model_cfg.pop("context_length", None)
                                 if str(result.target_provider or "").strip().lower() != "custom":
-                                    clear_model_endpoint_credentials(_persist_model_cfg)
+                                    clear_model_endpoint_credentials(_persist_model_cfg, clear_base_url=True)
                                 from hermes_cli.config import save_config
                                 save_config(_persist_cfg)
                             except Exception as e:
@@ -1290,18 +1451,19 @@ class GatewaySlashCommandsMixin:
                         lines.append(t("gateway.model.provider_label", provider=plabel))
                         mi = result.model_info
                         from hermes_cli.model_switch import resolve_display_context_length
-                        _sw_config_ctx = None
-                        try:
-                            _sw_cfg = _load_gateway_config()
-                            _sw_model_cfg = _sw_cfg.get("model", {})
-                            if isinstance(_sw_model_cfg, dict):
-                                _sw_raw = _sw_model_cfg.get("context_length")
-                                if _sw_raw is None:
-                                    _sw_raw = _sw_model_cfg.get("max_context_length")
-                                if _sw_raw is not None:
-                                    _sw_config_ctx = int(_sw_raw)
-                        except Exception:
-                            pass
+                        _sw_config_ctx = max_context_cap if max_context_arg is not None else None
+                        if _sw_config_ctx is None:
+                            try:
+                                _sw_cfg = _load_gateway_config()
+                                from hermes_cli.context_window import scoped_model_config_context_length
+                                _sw_config_ctx = scoped_model_config_context_length(
+                                    _sw_cfg,
+                                    model=result.new_model,
+                                    provider=result.target_provider,
+                                    base_url=result.base_url or current_base_url or "",
+                                )
+                            except Exception:
+                                pass
                         ctx = resolve_display_context_length(
                             result.new_model,
                             result.target_provider,
@@ -1316,8 +1478,6 @@ class GatewaySlashCommandsMixin:
                         if mi:
                             if mi.max_output:
                                 lines.append(t("gateway.model.max_output_label", tokens=f"{mi.max_output:,}"))
-                            if mi.has_cost_data():
-                                lines.append(t("gateway.model.cost_label", cost=mi.format_cost()))
                             lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
                         if result.warning_message:
                             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
@@ -1345,7 +1505,10 @@ class GatewaySlashCommandsMixin:
             lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label), ""]
 
             try:
-                providers = list_authenticated_providers(
+                # Offload blocking provider-listing off the event loop so the
+                # gateway doesn't freeze on a stale-cache HTTP fetch. See #41289.
+                providers = await asyncio.to_thread(
+                    list_authenticated_providers,
                     current_provider=current_provider,
                     current_base_url=current_base_url,
                     current_model=current_model,
@@ -1372,7 +1535,15 @@ class GatewaySlashCommandsMixin:
             return "\n".join(lines)
 
         # Perform the switch
-        result = _switch_model(
+        skew_error = _model_switch_skew_guard()
+        if skew_error:
+            return skew_error
+        # Offload the switch off the event loop — switch_model() can fall
+        # through to a synchronous models.dev HTTP fetch (requests.get, 15s
+        # timeout) on a cold/expired cache, which freezes the gateway
+        # otherwise. See #20525, #41289.
+        result = await asyncio.to_thread(
+            _switch_model,
             raw_input=model_input,
             current_provider=current_provider,
             current_model=current_model,
@@ -1421,6 +1592,7 @@ class GatewaySlashCommandsMixin:
                         api_key=result.api_key,
                         base_url=result.base_url,
                         api_mode=result.api_mode,
+                        config_context_length=max_context_cap if max_context_arg is not None else None,
                     )
                 except Exception as exc:
                     # In-place swap rolled the agent back to the OLD working
@@ -1444,6 +1616,11 @@ class GatewaySlashCommandsMixin:
             if _sess_db is not None:
                 try:
                     _sess_entry = self.session_store.get_or_create_session(source)
+                    # If this session was auto-reset, consume the flag so the
+                    # next regular message's cleanup does not wipe the model
+                    # override just stored below (Closes #48031).
+                    if getattr(_sess_entry, "was_auto_reset", False):
+                        _sess_entry.was_auto_reset = False
                     _sess_db.update_session_model(
                         _sess_entry.session_id, result.new_model
                     )
@@ -1470,6 +1647,13 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
+            if max_context_arg is not None:
+                if max_context_cap:
+                    self._session_model_overrides[session_key]["max_context_length"] = max_context_cap
+                    self._session_model_overrides[session_key].pop("context_length", None)
+                else:
+                    self._session_model_overrides[session_key].pop("max_context_length", None)
+                    self._session_model_overrides[session_key].pop("context_length", None)
 
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.
@@ -1502,8 +1686,15 @@ class GatewaySlashCommandsMixin:
                     model_cfg["provider"] = result.target_provider
                     if result.base_url:
                         model_cfg["base_url"] = result.base_url
+                    if max_context_arg is not None:
+                        if max_context_cap:
+                            model_cfg["max_context_length"] = max_context_cap
+                            model_cfg.pop("context_length", None)
+                        else:
+                            model_cfg.pop("max_context_length", None)
+                            model_cfg.pop("context_length", None)
                     if str(result.target_provider or "").strip().lower() != "custom":
-                        clear_model_endpoint_credentials(model_cfg)
+                        clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
                     from hermes_cli.config import save_config
                     save_config(cfg)
                 except Exception as e:
@@ -1518,18 +1709,19 @@ class GatewaySlashCommandsMixin:
             # Copilot, and Nous-enforced caps win over the raw models.dev entry.
             mi = result.model_info
             from hermes_cli.model_switch import resolve_display_context_length
-            _sw2_config_ctx = None
-            try:
-                _sw2_cfg = _load_gateway_config()
-                _sw2_model_cfg = _sw2_cfg.get("model", {})
-                if isinstance(_sw2_model_cfg, dict):
-                    _sw2_raw = _sw2_model_cfg.get("context_length")
-                    if _sw2_raw is None:
-                        _sw2_raw = _sw2_model_cfg.get("max_context_length")
-                    if _sw2_raw is not None:
-                        _sw2_config_ctx = int(_sw2_raw)
-            except Exception:
-                pass
+            _sw2_config_ctx = max_context_cap if max_context_arg is not None else None
+            if _sw2_config_ctx is None:
+                try:
+                    _sw2_cfg = _load_gateway_config()
+                    from hermes_cli.context_window import scoped_model_config_context_length
+                    _sw2_config_ctx = scoped_model_config_context_length(
+                        _sw2_cfg,
+                        model=result.new_model,
+                        provider=result.target_provider,
+                        base_url=result.base_url or current_base_url or "",
+                    )
+                except Exception:
+                    pass
             ctx = resolve_display_context_length(
                 result.new_model,
                 result.target_provider,
@@ -1544,8 +1736,6 @@ class GatewaySlashCommandsMixin:
             if mi:
                 if mi.max_output:
                     lines.append(t("gateway.model.max_output_label", tokens=f"{mi.max_output:,}"))
-                if mi.has_cost_data():
-                    lines.append(t("gateway.model.cost_label", cost=mi.format_cost()))
                 lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
 
             # Cache notice
@@ -1785,6 +1975,10 @@ class GatewaySlashCommandsMixin:
         if not args or lower == "status":
             return mgr.status_line()
 
+        # /goal show → print the active goal's completion contract
+        if lower == "show":
+            return f"{mgr.status_line()}\n{mgr.render_contract()}"
+
         if lower == "pause":
             state = mgr.pause(reason="user-paused")
             if state is None:
@@ -1840,9 +2034,38 @@ class GatewaySlashCommandsMixin:
                 return "▶ Wait barrier cleared — goal loop resumes."
             return "No wait barrier set."
 
+        # /goal draft <objective> → draft a structured completion contract,
+        # then set it. The aux LLM call is sync; run it off the event loop.
+        draft_contract_obj = None
+        if lower.startswith("draft"):
+            objective = args[len("draft"):].strip()
+            if not objective:
+                return "Usage: /goal draft <objective in plain language>"
+            try:
+                import asyncio
+                from hermes_cli.goals import draft_contract
+
+                draft_contract_obj = await asyncio.get_running_loop().run_in_executor(
+                    None, draft_contract, objective
+                )
+            except Exception as exc:
+                logger.debug("goal draft failed: %s", exc)
+                draft_contract_obj = None
+            args = objective  # the goal text is the objective
+            contract = draft_contract_obj
+        else:
+            # Inline `field: value` lines parse into a completion contract;
+            # the remaining prose is the goal headline. Plain free-form goals
+            # (no such lines) behave exactly as before.
+            from hermes_cli.goals import parse_contract
+
+            headline, parsed = parse_contract(args)
+            args = headline or args
+            contract = parsed if not parsed.is_empty() else None
+
         # Otherwise — treat the remaining text as the new goal.
         try:
-            state = mgr.set(args)
+            state = mgr.set(args, contract=contract)
         except ValueError as exc:
             return t("gateway.goal.invalid", error=str(exc))
 
@@ -1863,7 +2086,13 @@ class GatewaySlashCommandsMixin:
             except Exception as exc:
                 logger.debug("goal kickoff enqueue failed: %s", exc)
 
-        return t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
+        base = t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
+        if state.has_contract():
+            return f"{base}\nCompletion contract:\n{state.contract.render_block()}"
+        if lower.startswith("draft"):
+            # Drafting was requested but the aux model couldn't produce one.
+            return f"{base}\n(Couldn't draft a contract — running as a free-form goal.)"
+        return base
 
     async def _handle_subgoal_command(self, event: "MessageEvent") -> str:
         """Handle /subgoal for gateway platforms (mirror of CLI handler).
@@ -2312,7 +2541,7 @@ class GatewaySlashCommandsMixin:
         from gateway.run import _hermes_home
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa
-        from tools.memory_tool import MemoryStore
+        from tools.memory_tool import load_on_disk_store
 
         raw_args = event.get_command_args().strip()
         args = raw_args.split() if raw_args else []
@@ -2332,8 +2561,8 @@ class GatewaySlashCommandsMixin:
 
         # Apply approved writes against a fresh on-disk store (the gateway has
         # no long-lived agent; the store persists to the same MEMORY/USER.md).
-        store = MemoryStore()
-        store.load_from_disk()
+        # load_on_disk_store() honors the user's configured char limits.
+        store = load_on_disk_store()
 
         out = handle_pending_subcommand(
             wa.MEMORY, args, memory_store=store, set_mode_fn=_set_approval,
@@ -2458,65 +2687,6 @@ class GatewaySlashCommandsMixin:
         if _save_config_key("agent.service_tier", saved_value):
             return t("gateway.fast.saved", label=label)
         return t("gateway.fast.session_only", label=label)
-
-    async def _handle_caveman_command(self, event: MessageEvent) -> str:
-        """Handle ``/caveman [lite|full|ultra|wenyan|off] [--global]``.
-
-        Session-scoped like /model: stores a per-chat override so other gateway
-        chats keep their own level (the footer reads it via
-        _caveman_level_for_session). ``--global`` writes the global default
-        file for new sessions. Compression stays prompt-driven via the caveman
-        skill. Local patch #9.
-        """
-        raw = (event.get_command_args() or "").strip().lower()
-        tokens = raw.split() if raw else []
-        persist_global = "--global" in tokens or "--save" in tokens
-        tokens = [t for t in tokens if t not in ("--global", "--save")]
-        arg = tokens[0] if tokens else ""
-        _LEVELS = ("lite", "full", "ultra", "wenyan")
-        _OFF = ("off", "normal", "disable", "disabled")
-
-        session_key = self._session_key_for_source(event.source)
-
-        if not arg:
-            cur = self._caveman_level_for_session(session_key)
-            opts = ", ".join(_LEVELS) + ", off"
-            return (f"Caveman: 🪨 {cur}\n"
-                    f"Options: {opts}\n"
-                    f"/caveman <level> [--global]")
-
-        if arg in _OFF:
-            level = "off"
-        elif arg in _LEVELS:
-            level = arg
-        else:
-            return f"Unknown caveman level: {arg}. Use lite|full|ultra|wenyan|off."
-
-        # Per-chat override (session-scoped) — other chats unaffected.
-        self._session_caveman_overrides[session_key] = level
-
-        # Persist as new-session default (--global).
-        if persist_global:
-            import os as _os
-            from pathlib import Path
-            state_file = Path.home() / ".hermes" / "caveman_mode"
-            try:
-                if level == "off":
-                    if state_file.exists():
-                        state_file.unlink()
-                else:
-                    tmp = state_file.with_suffix(".tmp")
-                    tmp.write_text(level, encoding="utf-8")
-                    _os.replace(str(tmp), str(state_file))
-            except Exception as exc:
-                return f"🪨 caveman: {level} (this chat). ⚠ --global write failed: {exc}"
-
-        if persist_global:
-            scope = "global default updated (--global)"
-        else:
-            scope = "this chat only — add --global for new-session default"
-        hint = "" if level == "off" else " Load the caveman skill for compression."
-        return f"🪨 caveman: {level} ({scope}).{hint}"
 
     async def _handle_yolo_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /yolo — toggle dangerous command approval bypass for this session only."""
@@ -2754,9 +2924,14 @@ class GatewaySlashCommandsMixin:
                 skip_memory=True,
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
+                session_db=self._session_db,
             )
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
+                # Prevent close() from ending the newly rotated session —
+                # the gateway session entry now points at the new id and
+                # must remain open for the next user turn.
+                tmp_agent._end_session_on_close = False
 
                 # Estimate with system prompt + tool schemas included so the
                 # figure reflects real request pressure, not a transcript-only
@@ -2790,7 +2965,7 @@ class GatewaySlashCommandsMixin:
                 # transcript replaced with the compacted set).
                 new_session_id = tmp_agent.session_id
                 rotated = new_session_id != session_entry.session_id
-                _in_place = bool(getattr(tmp_agent, "compression_in_place", False))
+                _in_place = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
                 if rotated:
                     session_entry.session_id = new_session_id
                     self.session_store._save()
@@ -3445,41 +3620,13 @@ class GatewaySlashCommandsMixin:
             # Session token usage — detailed breakdown matching CLI
             input_tokens = getattr(agent, "session_input_tokens", 0) or 0
             output_tokens = getattr(agent, "session_output_tokens", 0) or 0
-            cache_read = getattr(agent, "session_cache_read_tokens", 0) or 0
-            cache_write = getattr(agent, "session_cache_write_tokens", 0) or 0
 
             lines.append(t("gateway.usage.header_session"))
             lines.append(t("gateway.usage.label_model", model=agent.model))
             lines.append(t("gateway.usage.label_input_tokens", count=f"{input_tokens:,}"))
-            if cache_read:
-                lines.append(t("gateway.usage.label_cache_read", count=f"{cache_read:,}"))
-            if cache_write:
-                lines.append(t("gateway.usage.label_cache_write", count=f"{cache_write:,}"))
             lines.append(t("gateway.usage.label_output_tokens", count=f"{output_tokens:,}"))
             lines.append(t("gateway.usage.label_total", count=f"{agent.session_total_tokens:,}"))
             lines.append(t("gateway.usage.label_api_calls", count=agent.session_api_calls))
-
-            # Cost estimation
-            try:
-                from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
-                cost_result = estimate_usage_cost(
-                    agent.model,
-                    CanonicalUsage(
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        cache_read_tokens=cache_read,
-                        cache_write_tokens=cache_write,
-                    ),
-                    provider=getattr(agent, "provider", None),
-                    base_url=getattr(agent, "base_url", None),
-                )
-                if cost_result.amount_usd is not None:
-                    prefix = "~" if cost_result.status == "estimated" else ""
-                    lines.append(t("gateway.usage.label_cost", prefix=prefix, amount=f"{float(cost_result.amount_usd):.4f}"))
-                elif cost_result.status == "included":
-                    lines.append(t("gateway.usage.label_cost_included"))
-            except Exception:
-                pass
 
             # Context window and compressions
             ctx = agent.context_compressor
