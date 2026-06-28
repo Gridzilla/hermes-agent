@@ -1038,6 +1038,9 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             "Check this code for bugs",
             "Find bugs in this code",
             "Perform a code review of the parser",
+            "GPT-5.5 review: audit the code and report blockers only. Do not implement.",
+            "Request a review from gpt55 of the implemented failure classifier fix and tests",
+            "Adversarial review before serious run: inspect artifacts, tests, and diff; no code changes.",
         ):
             with self.subTest(goal=goal):
                 task = {"goal": goal, "toolsets": ["terminal", "file"]}
@@ -1046,6 +1049,58 @@ class TestDelegationCredentialResolution(unittest.TestCase):
 
                 self.assertEqual(selected.get("provider"), "")
                 self.assertEqual(selected.get("model"), "")
+
+    def test_review_route_applies_to_review_task(self):
+        cfg = {
+            "model": "",
+            "provider": "",
+            "routes": {
+                "review": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.5",
+                },
+                "coding": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.3-codex-spark",
+                },
+            },
+        }
+        for goal in (
+            "Review this code diff for logic errors",
+            "GPT-5.5 review: audit the code and report blockers only. Do not implement.",
+            "Request a review from gpt55 of the implemented failure classifier fix and tests",
+        ):
+            with self.subTest(goal=goal):
+                task = {"goal": goal, "toolsets": ["terminal", "file"]}
+
+                selected = _select_delegation_config_for_task(cfg, task)
+
+                self.assertEqual(selected["provider"], "openai-codex")
+                self.assertEqual(selected["model"], "gpt-5.5")
+
+    def test_review_route_precedes_coding_route_when_both_match(self):
+        cfg = {
+            "provider": "",
+            "routes": {
+                "review": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.5",
+                },
+                "coding": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.3-codex-spark",
+                },
+            },
+        }
+        task = {
+            "goal": "Request a review from gpt55 of the implemented parser fix and tests",
+            "toolsets": ["terminal", "file"],
+        }
+
+        selected = _select_delegation_config_for_task(cfg, task)
+
+        self.assertEqual(selected["provider"], "openai-codex")
+        self.assertEqual(selected["model"], "gpt-5.5")
 
     def test_broad_build_non_software_task_does_not_route_as_coding(self):
         cfg = {

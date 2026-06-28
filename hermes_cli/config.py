@@ -1961,14 +1961,24 @@ DEFAULT_CONFIG = {
         "subagent_auto_approve": False,
         # Optional per-task routing overlays. A route only applies when its
         # classifier matches; otherwise subagents use the base delegation
-        # provider/model above (or inherit the parent when blank). Currently
-        # supported: routes.coding for implementation/build/refactor/debug/test
-        # tasks. Example:
+        # provider/model above (or inherit the parent when blank). Review routes
+        # take precedence over coding routes so explicit reviewer requests are
+        # not hijacked by implementation keywords in the prompt. Example:
         # routes:
+        #   review:
+        #     provider: openai-codex
+        #     model: gpt-5.5
         #   coding:
         #     provider: openai-codex
         #     model: gpt-5.3-codex-spark
         "routes": {
+            "review": {
+                "provider": "",
+                "model": "",
+                "base_url": "",
+                "api_key": "",
+                "api_mode": "",
+            },
             "coding": {
                 "provider": "",
                 "model": "",

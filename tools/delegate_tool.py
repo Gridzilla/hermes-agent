@@ -2780,8 +2780,13 @@ _REVIEW_INTENT_PREFIXES = (
     "reviewer ",
     "audit ",
     "critique ",
+    "re-review ",
     "code review ",
     "please review ",
+    "request a review ",
+    "request review ",
+    "send a review ",
+    "send review ",
     "perform a code review ",
     "perform code review ",
     "do a review ",
@@ -2791,6 +2796,31 @@ _REVIEW_INTENT_PREFIXES = (
 )
 _REVIEW_INTENT_LEADING_VERBS = ("check", "find", "analyze", "analyse", "inspect", "look for")
 _REVIEW_INTENT_OBJECTS = ("code", "diff", "patch", "bug", "bugs", "logic error", "security issue")
+_EXPLICIT_REVIEW_MODEL_HINTS = (
+    "gpt55",
+    "gpt-5.5",
+    "chatgpt55",
+    "chatgpt-5.5",
+)
+_REVIEW_INTENT_KEYWORDS = (
+    " review",
+    "re-review",
+    " audit",
+    " critique",
+    "adversarial review",
+)
+_REVIEW_IMPLEMENTATION_VERBS = (
+    "implement",
+    "fix",
+    "repair",
+    "modify",
+    "change",
+    "patch",
+    "refactor",
+    "add test",
+    "write test",
+    "make tests pass",
+)
 
 
 def _contains_route_keyword(text: str, keywords: tuple[str, ...]) -> bool:
@@ -2808,8 +2838,18 @@ def _contains_route_keyword(text: str, keywords: tuple[str, ...]) -> bool:
     return False
 
 
+def _has_explicit_review_model_hint(text: str) -> bool:
+    stripped = text.strip().lower()
+    return (
+        any(hint in stripped for hint in _EXPLICIT_REVIEW_MODEL_HINTS)
+        and any(keyword in f" {stripped}" for keyword in _REVIEW_INTENT_KEYWORDS)
+    )
+
+
 def _task_is_review_intent(text: str) -> bool:
     stripped = text.strip().lower()
+    if _has_explicit_review_model_hint(stripped):
+        return True
     if any(stripped.startswith(prefix) for prefix in _REVIEW_INTENT_PREFIXES):
         return True
     return any(
@@ -2833,7 +2873,14 @@ def _task_looks_like_coding(task: dict) -> bool:
     goal = str(task.get("goal") or "").lower()
     context = str(task.get("context") or "").lower()
     text = f"{goal}\n{context}"
-    if _task_is_review_intent(goal):
+    review_intent = _task_is_review_intent(text)
+    explicit_review_model = _has_explicit_review_model_hint(text)
+    implementation_request = _contains_route_keyword(goal, _REVIEW_IMPLEMENTATION_VERBS)
+    explicit_no_edit = any(
+        phrase in text
+        for phrase in ("do not implement", "don't implement", "do not edit", "no code changes")
+    )
+    if review_intent and (explicit_review_model or explicit_no_edit or not implementation_request):
         return False
     has_strong_keyword = _contains_route_keyword(text, _CODING_ROUTE_STRONG_KEYWORDS)
     has_broad_keyword = _contains_route_keyword(text, _CODING_ROUTE_BROAD_KEYWORDS)
@@ -2841,23 +2888,50 @@ def _task_looks_like_coding(task: dict) -> bool:
     return has_strong_keyword or (has_broad_keyword and has_software_term)
 
 
+def _task_looks_like_review(task: dict) -> bool:
+    """Conservative heuristic for routing review/audit-only tasks."""
+    if not isinstance(task, dict):
+        return False
+    goal = str(task.get("goal") or "").lower()
+    context = str(task.get("context") or "").lower()
+    text = f"{goal}\n{context}"
+    review_intent = _task_is_review_intent(text)
+    explicit_review_model = _has_explicit_review_model_hint(text)
+    implementation_request = _contains_route_keyword(goal, _REVIEW_IMPLEMENTATION_VERBS)
+    explicit_no_edit = any(
+        phrase in text
+        for phrase in ("do not implement", "don't implement", "do not edit", "no code changes")
+    )
+    return review_intent and (explicit_review_model or explicit_no_edit or not implementation_request)
+
+
+def _overlay_delegation_route(selected: dict, route: dict) -> None:
+    """Overlay non-empty provider/model credential fields from a route in-place."""
+    for key in ("model", "provider", "base_url", "api_key", "api_mode"):
+        value = route.get(key)
+        if value not in (None, ""):
+            selected[key] = value
+
+
 def _select_delegation_config_for_task(cfg: dict, task: dict) -> dict:
     """Return the effective delegation config for one task.
 
-    ``delegation.routes.coding`` overlays the base delegation config only for
-    tasks that look like implementation/build/refactor/debug/test work. This
-    lets users reserve a coding-plan model (for example OpenAI Codex Spark) for
-    coding subagents while non-coding delegation inherits the parent or uses the
-    base ``delegation.provider``/``delegation.model``.
+    ``delegation.routes.review`` overlays first for review/audit-only tasks.
+    ``delegation.routes.coding`` then overlays for implementation/build/refactor/
+    debug/test work. This lets users reserve separate reviewer and coding models
+    while non-matching delegations inherit the parent or base delegation config.
     """
     selected = dict(cfg or {})
     routes = selected.get("routes") or {}
-    coding_route = routes.get("coding") if isinstance(routes, dict) else None
-    if isinstance(coding_route, dict) and _task_looks_like_coding(task):
-        for key in ("model", "provider", "base_url", "api_key", "api_mode"):
-            value = coding_route.get(key)
-            if value not in (None, ""):
-                selected[key] = value
+    if isinstance(routes, dict):
+        review_route = routes.get("review")
+        if isinstance(review_route, dict) and _task_looks_like_review(task):
+            _overlay_delegation_route(selected, review_route)
+            return selected
+
+        coding_route = routes.get("coding")
+        if isinstance(coding_route, dict) and _task_looks_like_coding(task):
+            _overlay_delegation_route(selected, coding_route)
     return selected
 
 
